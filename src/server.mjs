@@ -31,7 +31,7 @@ function ensureSecretsConfigured() {
 
 let storePromise
 
-async function getStore(requireRemote = false) {
+export async function getStore(requireRemote = false) {
   if (!storePromise) {
     storePromise = createStore({ requireRemote }).catch((error) => {
       storePromise = null
@@ -399,32 +399,5 @@ export async function handleBackendRequest(request, response, { requireRemote = 
     const message = error.message || 'The request could not be completed.'
     if (!response.headersSent) return json(response, status, { error: message })
     response.destroy()
-  }
-}
-
-const isServerless = process.env.FINGROW_SERVERLESS === '1' || Boolean(process.env.VERCEL) || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME)
-
-if (!isServerless) {
-  const server = createServer((request, response) => {
-    void handleBackendRequest(request, response)
-  })
-
-  getStore().then((database) => database.initialize()).then(() => {
-    server.listen(PORT, HOST, () => {
-      console.info(`FinGrow backend listening at http://${HOST}:${PORT}`)
-      if (!mailer) console.warn('SMTP is not configured; email verification requests will be rejected.')
-    })
-  }).catch(() => {
-    console.error('FinGrow backend could not initialize storage. Check its database configuration.')
-    process.exitCode = 1
-  })
-
-  for (const signal of ['SIGINT', 'SIGTERM']) {
-    process.on(signal, () => {
-      server.close(async () => {
-        try { (await getStore()).close() } catch {}
-        process.exit(0)
-      })
-    })
   }
 }
