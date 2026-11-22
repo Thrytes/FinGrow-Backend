@@ -2,18 +2,16 @@ import { handleBackendRequest } from '../src/server.mjs'
 
 export const config = { api: { bodyParser: false } }
 
-function resolvePath(req) {
-  const candidate = req.headers['x-forwarded-uri'] || req.url || '/'
-  const parsed = new URL(candidate, 'http://localhost')
-  let p = parsed.pathname
-  if (p === '/api/index' || p === '/api' || p === '' || p === '/index') {
-    p = '/health'
-  }
-  return p + parsed.search
-}
-
 export default async function handler(req, res) {
   process.env.FINGROW_SERVERLESS = '1'
-  req.url = resolvePath(req)
+  const parsed = new URL(req.url || '/', 'http://localhost')
+  const rewritten = parsed.searchParams.get('__path')
+  if (rewritten) {
+    parsed.searchParams.delete('__path')
+    const search = parsed.searchParams.toString()
+    req.url = rewritten + (search ? `?${search}` : '')
+  } else if (parsed.pathname === '/api/index' || parsed.pathname === '/api') {
+    req.url = '/health'
+  }
   return handleBackendRequest(req, res, { requireRemote: true })
 }
