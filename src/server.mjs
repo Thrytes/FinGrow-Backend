@@ -342,6 +342,7 @@ async function route(request, response, database) {
   if (pathname.startsWith('/api/')) {
     pathname = pathname.slice(4)
   }
+  pathname = pathname.replace(/\/+$/, '') || '/'
   if (pathname === '/index' || pathname === '') {
     pathname = '/'
   }
