@@ -106,16 +106,15 @@ function setCors(request, response) {
 async function readJson(request) {
   const declaredLength = Number(request.headers['content-length'] || 0)
   if (declaredLength > BODY_LIMIT) throw Object.assign(new Error('Request is too large.'), { status: 413 })
-  if (request.body !== undefined && request.body !== null) {
+  if (request.body !== undefined && request.body !== null && request.body !== '') {
     const body = request.body
-    const size = Buffer.byteLength(typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body))
-    if (size > BODY_LIMIT) throw Object.assign(new Error('Request is too large.'), { status: 413 })
+    if (typeof body === 'object' && !Buffer.isBuffer(body) && !Array.isArray(body)) return body
     try {
-      const value = typeof body === 'string' || Buffer.isBuffer(body) ? JSON.parse(String(body)) : body
-      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error()
-      return value
+      const str = (typeof body === 'string' || Buffer.isBuffer(body) ? String(body) : JSON.stringify(body)).replace(/^\uFEFF/, '').trim()
+      const value = JSON.parse(str)
+      if (value && typeof value === 'object' && !Array.isArray(value)) return value
     } catch {
-      throw Object.assign(new Error('Send a valid JSON object.'), { status: 400 })
+      // Continue to stream read fallback
     }
   }
   const chunks = []
@@ -125,8 +124,10 @@ async function readJson(request) {
     if (length > BODY_LIMIT) throw Object.assign(new Error('Request is too large.'), { status: 413 })
     chunks.push(chunk)
   }
+  const raw = Buffer.concat(chunks).toString('utf8').replace(/^\uFEFF/, '').trim()
+  if (!raw) throw Object.assign(new Error('Send a valid JSON object.'), { status: 400 })
   try {
-    const value = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    const value = JSON.parse(raw)
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error()
     return value
   } catch {
