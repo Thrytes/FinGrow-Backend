@@ -402,7 +402,9 @@ export async function handleBackendRequest(request, response, { requireRemote = 
   }
 }
 
-if (process.env.FINGROW_SERVERLESS !== '1' && !process.env.VERCEL) {
+const isServerless = process.env.FINGROW_SERVERLESS === '1' || Boolean(process.env.VERCEL) || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME)
+
+if (!isServerless) {
   const server = createServer((request, response) => {
     void handleBackendRequest(request, response)
   })
