@@ -404,7 +404,7 @@ async function route(request, response, database) {
     return json(response, result.status, result.body)
   }
 
-  return json(response, 404, { error: 'Not found.' })
+  return json(response, 404, { error: 'Not found.', url: request.url, pathname })
 }
 
 export async function handleBackendRequest(request, response, { requireRemote = false } = {}) {
