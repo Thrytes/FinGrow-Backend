@@ -11,8 +11,8 @@ const ENVELOPE_LIMIT = onVercel ? 3 * 1024 * 1024 : BODY_LIMIT
 const OTP_TTL_MS = 10 * 60 * 1000
 const TOKEN_TTL_MS = 90 * 24 * 60 * 60 * 1000
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-const otpSecret = process.env.FINGROW_OTP_HASH_SECRET || ''
-const tokenSecret = process.env.FINGROW_TOKEN_HASH_SECRET || ''
+const getOtpSecret = () => process.env.FINGROW_OTP_HASH_SECRET || ''
+const getTokenSecret = () => process.env.FINGROW_TOKEN_HASH_SECRET || ''
 const allowedOrigins = new Set(
   (process.env.FINGROW_ALLOWED_ORIGINS || 'tauri://localhost,http://tauri.localhost')
     .split(',')
@@ -20,8 +20,13 @@ const allowedOrigins = new Set(
     .filter(Boolean),
 )
 
-if (Buffer.byteLength(otpSecret) < 32 || Buffer.byteLength(tokenSecret) < 32) {
-  throw new Error('Set independent FINGROW_OTP_HASH_SECRET and FINGROW_TOKEN_HASH_SECRET values (32+ bytes each).')
+function ensureSecretsConfigured() {
+  if (Buffer.byteLength(getOtpSecret()) < 32 || Buffer.byteLength(getTokenSecret()) < 32) {
+    throw Object.assign(
+      new Error('Set independent FINGROW_OTP_HASH_SECRET and FINGROW_TOKEN_HASH_SECRET environment variables (at least 32 bytes each) in Vercel settings.'),
+      { status: 503 },
+    )
+  }
 }
 
 let storePromise
@@ -127,11 +132,11 @@ function cleanText(value, maxLength) {
 }
 
 function challengeHash(id, code) {
-  return createHmac('sha256', otpSecret).update(`${id}:${code}`).digest('hex')
+  return createHmac('sha256', getOtpSecret()).update(`${id}:${code}`).digest('hex')
 }
 
 function tokenHash(token) {
-  return createHmac('sha256', tokenSecret).update(token).digest('hex')
+  return createHmac('sha256', getTokenSecret()).update(token).digest('hex')
 }
 
 function safeEqualHex(left, right) {
@@ -385,20 +390,19 @@ async function route(request, response, database) {
 
 export async function handleBackendRequest(request, response, { requireRemote = false } = {}) {
   try {
+    ensureSecretsConfigured()
     const database = await getStore(requireRemote)
     await database.initialize()
     return await route(request, response, database)
   } catch (error) {
     const status = error.status || (String(error.message).includes('TURSO_DATABASE_URL') ? 503 : 500)
-    const message = error.status ? error.message
-      : status === 503 ? 'The hosted sync database is not configured.'
-      : 'The request could not be completed.'
+    const message = error.message || 'The request could not be completed.'
     if (!response.headersSent) return json(response, status, { error: message })
     response.destroy()
   }
 }
 
-if (process.env.FINGROW_SERVERLESS !== '1') {
+if (process.env.FINGROW_SERVERLESS !== '1' && !process.env.VERCEL) {
   const server = createServer((request, response) => {
     void handleBackendRequest(request, response)
   })
