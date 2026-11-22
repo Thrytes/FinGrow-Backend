@@ -13,12 +13,19 @@ const TOKEN_TTL_MS = 90 * 24 * 60 * 60 * 1000
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const getOtpSecret = () => process.env.FINGROW_OTP_HASH_SECRET || ''
 const getTokenSecret = () => process.env.FINGROW_TOKEN_HASH_SECRET || ''
-const allowedOrigins = new Set(
-  (process.env.FINGROW_ALLOWED_ORIGINS || 'tauri://localhost,http://tauri.localhost')
-    .split(',')
-    .map((origin) => origin.trim())
-    .filter(Boolean),
-)
+const defaultOrigins = [
+  'tauri://localhost',
+  'http://tauri.localhost',
+  'https://tauri.localhost',
+  'http://localhost',
+  'https://localhost',
+  'http://127.0.0.1',
+]
+const envOrigins = (process.env.FINGROW_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean)
+const allowedOrigins = new Set([...defaultOrigins, ...envOrigins])
 
 function ensureSecretsConfigured() {
   if (Buffer.byteLength(getOtpSecret()) < 32 || Buffer.byteLength(getTokenSecret()) < 32) {
@@ -83,7 +90,11 @@ const json = (response, status, value, extraHeaders = {}) => {
 function setCors(request, response) {
   const origin = request.headers.origin
   if (!origin) return true
-  if (!allowedOrigins.has(origin)) return false
+  const isAllowed =
+    allowedOrigins.has(origin) ||
+    /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
+    /^https?:\/\/tauri\.localhost(:\d+)?$/.test(origin)
+  if (!isAllowed) return false
   response.setHeader('Access-Control-Allow-Origin', origin)
   response.setHeader('Vary', 'Origin')
   response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type')
