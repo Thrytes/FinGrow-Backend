@@ -338,7 +338,7 @@ async function route(request, response, database) {
     return response.end()
   }
   const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`)
-  let pathname = url.pathname
+  let pathname = url.searchParams.get('__path') || url.pathname
   if (pathname.startsWith('/api/')) {
     pathname = pathname.slice(4)
   }
@@ -404,7 +404,7 @@ async function route(request, response, database) {
     return json(response, result.status, result.body)
   }
 
-  return json(response, 404, { error: 'Not found.', url: request.url, pathname })
+  return json(response, 404, { error: 'Not found.' })
 }
 
 export async function handleBackendRequest(request, response, { requireRemote = false } = {}) {
