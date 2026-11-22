@@ -401,3 +401,8 @@ export async function handleBackendRequest(request, response, { requireRemote = 
     response.destroy()
   }
 }
+
+export default async function vercelHandler(request, response) {
+  process.env.FINGROW_SERVERLESS = '1'
+  return handleBackendRequest(request, response, { requireRemote: true })
+}
