@@ -166,7 +166,13 @@ export async function createStore({ requireRemote = false } = {}) {
     return new RemoteTursoStore(client)
   }
 
-  const { DatabaseSync } = await import('node:sqlite')
+  let DatabaseSync
+  try {
+    const sqliteMod = await import('node:sqlite')
+    DatabaseSync = sqliteMod.DatabaseSync
+  } catch {
+    throw new Error('Local SQLite is only supported on Node 22.5+. For hosted Vercel, configure TURSO_DATABASE_URL and TURSO_AUTH_TOKEN.')
+  }
   const dataDirectory = resolve(process.env.FINGROW_BACKEND_DATA_DIR || './data')
   mkdirSync(dataDirectory, { recursive: true })
   const database = new DatabaseSync(resolve(dataDirectory, 'fingrow-backend.sqlite'))
