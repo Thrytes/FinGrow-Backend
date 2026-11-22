@@ -338,16 +338,23 @@ async function route(request, response, database) {
     return response.end()
   }
   const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`)
-  if (request.method === 'GET' && (url.pathname === '/health' || url.pathname === '/')) {
+  let pathname = url.pathname
+  if (pathname.startsWith('/api/')) {
+    pathname = pathname.slice(4)
+  }
+  if (pathname === '/index' || pathname === '') {
+    pathname = '/'
+  }
+  if (request.method === 'GET' && (pathname === '/health' || pathname === '/')) {
     return json(response, 200, { ok: true, service: 'fingrow-backend', storage: 'connected', smtpConfigured })
   }
-  if (request.method === 'POST' && url.pathname === '/v1/auth/otp/request') {
+  if (request.method === 'POST' && pathname === '/v1/auth/otp/request') {
     return handleOtpRequest(request, response, database)
   }
-  if (request.method === 'POST' && url.pathname === '/v1/auth/otp/verify') {
+  if (request.method === 'POST' && pathname === '/v1/auth/otp/verify') {
     return handleOtpVerify(request, response, await readJson(request), database)
   }
-  if (request.method === 'GET' && url.pathname === '/v1/auth/me') {
+  if (request.method === 'GET' && pathname === '/v1/auth/me') {
     const user = await authUser(request, database)
     if (!user) return json(response, 401, { error: 'Your sync session expired. Verify your email again to reconnect.' })
     return json(response, 200, {
@@ -355,13 +362,13 @@ async function route(request, response, database) {
       profiles: await getProfiles(user.id, database),
     })
   }
-  if (request.method === 'POST' && url.pathname === '/v1/auth/logout') {
+  if (request.method === 'POST' && pathname === '/v1/auth/logout') {
     const match = /^Bearer ([A-Za-z0-9_-]{32,128})$/.exec(request.headers.authorization || '')
     if (match) await database.run('DELETE FROM access_tokens WHERE token_hash = ?', tokenHash(match[1]))
     return json(response, 200, { ok: true })
   }
 
-  const profileRoute = /^\/v1\/profiles\/([A-Za-z0-9_-]{1,80})\/snapshot$/.exec(url.pathname)
+  const profileRoute = /^\/v1\/profiles\/([A-Za-z0-9_-]{1,80})\/snapshot$/.exec(pathname)
   if (profileRoute && (request.method === 'GET' || request.method === 'PUT')) {
     const user = await authUser(request, database)
     if (!user) return json(response, 401, { error: 'Your sync session expired. Verify your email again to reconnect.' })
