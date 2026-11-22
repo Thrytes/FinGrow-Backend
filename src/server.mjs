@@ -322,7 +322,7 @@ async function route(request, response, database) {
     return response.end()
   }
   const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`)
-  if (request.method === 'GET' && url.pathname === '/health') {
+  if (request.method === 'GET' && (url.pathname === '/health' || url.pathname === '/')) {
     return json(response, 200, { ok: true, service: 'fingrow-backend', storage: 'connected', smtpConfigured })
   }
   if (request.method === 'POST' && url.pathname === '/v1/auth/otp/request') {
