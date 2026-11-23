@@ -6,6 +6,10 @@ const schemaStatements = [
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE COLLATE NOCASE,
     full_name TEXT NOT NULL,
+    password_hash TEXT,
+    consented_at INTEGER,
+    consent_version TEXT,
+    consents_json TEXT,
     created_at INTEGER NOT NULL
   ) STRICT`,
   `CREATE TABLE IF NOT EXISTS profiles (
@@ -59,6 +63,15 @@ class LocalSqliteStore {
     if (this.initialized) return
     this.database.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;')
     this.database.exec(`${schemaStatements.join(';\n')};`)
+    const migrations = [
+      'ALTER TABLE users ADD COLUMN password_hash TEXT',
+      'ALTER TABLE users ADD COLUMN consented_at INTEGER',
+      'ALTER TABLE users ADD COLUMN consent_version TEXT',
+      'ALTER TABLE users ADD COLUMN consents_json TEXT',
+    ]
+    for (const sql of migrations) {
+      try { this.database.exec(sql) } catch {}
+    }
     this.initialized = true
   }
 
@@ -110,6 +123,15 @@ class RemoteTursoStore {
     if (!this.initializePromise) {
       this.initializePromise = (async () => {
         for (const statement of schemaStatements) await this.client.execute(statement)
+        const migrations = [
+          'ALTER TABLE users ADD COLUMN password_hash TEXT',
+          'ALTER TABLE users ADD COLUMN consented_at INTEGER',
+          'ALTER TABLE users ADD COLUMN consent_version TEXT',
+          'ALTER TABLE users ADD COLUMN consents_json TEXT',
+        ]
+        for (const sql of migrations) {
+          try { await this.client.execute(sql) } catch {}
+        }
         this.initialized = true
       })()
     }

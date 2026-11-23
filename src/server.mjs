@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto'
+import { createHmac, randomBytes, randomInt, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { createStore } from './database.mjs'
@@ -80,8 +80,11 @@ const mailer = smtpConfigured
 const json = (response, status, value, extraHeaders = {}) => {
   response.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
     'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+    'Referrer-Policy': 'no-referrer',
     ...extraHeaders,
   })
   response.end(JSON.stringify(value))
@@ -154,6 +157,23 @@ function tokenHash(token) {
 function safeEqualHex(left, right) {
   if (!/^[0-9a-f]{64}$/i.test(left) || !/^[0-9a-f]{64}$/i.test(right)) return false
   return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'))
+}
+
+function hashPassword(password) {
+  const salt = randomBytes(16).toString('hex')
+  const derivedKey = scryptSync(password, salt, 64)
+  return `scrypt$${salt}$${derivedKey.toString('hex')}`
+}
+
+function verifyPassword(password, stored) {
+  if (!stored || typeof stored !== 'string' || !stored.startsWith('scrypt$')) return false
+  const parts = stored.split('$')
+  if (parts.length !== 3) return false
+  const [, salt, hash] = parts
+  const derivedKey = scryptSync(password, salt, 64)
+  const hashBuffer = Buffer.from(hash, 'hex')
+  if (derivedKey.length !== hashBuffer.length) return false
+  return timingSafeEqual(derivedKey, hashBuffer)
 }
 
 async function authUser(request, database) {
@@ -288,18 +308,29 @@ async function handleOtpVerify(request, response, body, database) {
 
       const consumed = await transaction.run('UPDATE otp_challenges SET consumed = 1 WHERE id = ? AND consumed = 0', id)
       if (consumed.changes !== 1) throw new Error('Verification code was already used.')
-      let user = await transaction.get('SELECT id, email, full_name FROM users WHERE email = ?', email)
+      let user = await transaction.get('SELECT id, email, full_name, password_hash, consented_at FROM users WHERE email = ?', email)
       if (challenge.purpose === 'profile' && !user) throw new Error('Account not found.')
+
+      const rawPassword = typeof body.password === 'string' && body.password.length >= 8 ? body.password : null
+      const passwordHash = rawPassword ? hashPassword(rawPassword) : null
+      const fullName = cleanText(body.fullName || challenge.full_name, 100) || 'FinGrow user'
+
       if (!user) {
-        user = { id: randomUUID(), email, full_name: challenge.full_name }
-        await transaction.run('INSERT INTO users (id, email, full_name, created_at) VALUES (?, ?, ?, ?)', user.id, user.email, user.full_name, Date.now())
+        user = { id: randomUUID(), email, full_name: fullName, consented_at: null }
+        await transaction.run('INSERT INTO users (id, email, full_name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)',
+          user.id, user.email, user.full_name, passwordHash, Date.now())
         const profile = profileFromChallenge(challenge, user.id)
         await transaction.run('INSERT INTO profiles (id, user_id, name, kind, currency, sync_salt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
           profile.id, profile.userId, profile.name, profile.kind, profile.currency, profile.syncSalt, profile.createdAt)
-      } else if (challenge.purpose === 'profile') {
-        const profile = profileFromChallenge(challenge, user.id, cleanText(body.profileId, 80) || randomUUID())
-        await transaction.run('INSERT INTO profiles (id, user_id, name, kind, currency, sync_salt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          profile.id, profile.userId, profile.name, profile.kind, profile.currency, profile.syncSalt, profile.createdAt)
+      } else {
+        if (passwordHash) {
+          await transaction.run('UPDATE users SET password_hash = ? WHERE id = ?', passwordHash, user.id)
+        }
+        if (challenge.purpose === 'profile') {
+          const profile = profileFromChallenge(challenge, user.id, cleanText(body.profileId, 80) || randomUUID())
+          await transaction.run('INSERT INTO profiles (id, user_id, name, kind, currency, sync_salt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            profile.id, profile.userId, profile.name, profile.kind, profile.currency, profile.syncSalt, profile.createdAt)
+        }
       }
       const profiles = await getProfiles(user.id, transaction)
       const token = await issueToken(user.id, transaction)
@@ -308,7 +339,12 @@ async function handleOtpVerify(request, response, body, database) {
         body: {
           accessToken: token,
           tokenExpiresInSeconds: TOKEN_TTL_MS / 1000,
-          user: { id: user.id, email: user.email, fullName: user.full_name },
+          user: {
+            id: user.id,
+            email: user.email,
+            fullName: user.full_name,
+            consented: Boolean(user.consented_at),
+          },
           profiles,
           activeProfileId: challenge.purpose === 'profile'
             ? profiles.at(-1)?.id
@@ -321,6 +357,54 @@ async function handleOtpVerify(request, response, body, database) {
     console.error('FinGrow OTP verification failed.')
     return json(response, 400, { error: 'Unable to verify this code. Request a new one and try again.' })
   }
+}
+
+async function handleConsent(request, response, body, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in before saving consent.' })
+  const version = cleanText(body.version, 40) || '2026.11-v1'
+  const consents = body.consents
+  if (!consents || typeof consents !== 'object') {
+    return json(response, 400, { error: 'Provide consent preferences.' })
+  }
+  if (!consents.encryptedCloudSync || !consents.localVault) {
+    return json(response, 400, { error: 'Essential cloud sync and local vault consents are required to use FinGrow.' })
+  }
+  const now = Date.now()
+  await database.run(
+    'UPDATE users SET consented_at = ?, consent_version = ?, consents_json = ? WHERE id = ?',
+    now,
+    version,
+    JSON.stringify(consents),
+    user.id,
+  )
+  return json(response, 200, { ok: true, consentedAt: new Date(now).toISOString() })
+}
+
+async function handlePasswordLogin(request, response, body, database) {
+  const email = cleanEmail(body.email)
+  const password = typeof body.password === 'string' ? body.password : ''
+  if (!EMAIL_PATTERN.test(email) || !password) {
+    return json(response, 400, { error: 'Enter your email address and password.' })
+  }
+  const user = await database.get('SELECT id, email, full_name, password_hash, consented_at FROM users WHERE email = ?', email)
+  if (!user || !user.password_hash || !verifyPassword(password, user.password_hash)) {
+    return json(response, 401, { error: 'Incorrect email or password.' })
+  }
+  const profiles = await getProfiles(user.id, database)
+  const token = await issueToken(user.id, database)
+  return json(response, 200, {
+    accessToken: token,
+    tokenExpiresInSeconds: TOKEN_TTL_MS / 1000,
+    user: {
+      id: user.id,
+      email: user.email,
+      fullName: user.full_name,
+      consented: Boolean(user.consented_at),
+    },
+    profiles,
+    activeProfileId: profiles[0]?.id,
+  })
 }
 
 function validEnvelope(envelope) {
@@ -355,6 +439,12 @@ async function route(request, response, database) {
   }
   if (request.method === 'POST' && pathname === '/v1/auth/otp/verify') {
     return handleOtpVerify(request, response, await readJson(request), database)
+  }
+  if (request.method === 'POST' && pathname === '/v1/auth/login') {
+    return handlePasswordLogin(request, response, await readJson(request), database)
+  }
+  if (request.method === 'POST' && pathname === '/v1/auth/consent') {
+    return handleConsent(request, response, await readJson(request), database)
   }
   if (request.method === 'GET' && pathname === '/v1/auth/me') {
     const user = await authUser(request, database)
