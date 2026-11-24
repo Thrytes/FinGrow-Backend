@@ -77,14 +77,42 @@ const mailer = smtpConfigured
     })
   : null
 
+const rateLimits = new Map()
+
+function getClientIp(request) {
+  const forwarded = request.headers['x-forwarded-for']
+  if (typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim()
+  }
+  return request.socket?.remoteAddress || '127.0.0.1'
+}
+
+function checkRateLimit(key, maxRequests, windowMs) {
+  const now = Date.now()
+  let record = rateLimits.get(key)
+  if (!record || record.resetAt <= now) {
+    record = { count: 1, resetAt: now + windowMs }
+    rateLimits.set(key, record)
+    return { ok: true, remaining: maxRequests - 1, resetInSeconds: Math.ceil(windowMs / 1000) }
+  }
+  if (record.count >= maxRequests) {
+    return { ok: false, remaining: 0, resetInSeconds: Math.ceil((record.resetAt - now) / 1000) }
+  }
+  record.count += 1
+  return { ok: true, remaining: maxRequests - record.count, resetInSeconds: Math.ceil((record.resetAt - now) / 1000) }
+}
+
 const json = (response, status, value, extraHeaders = {}) => {
   response.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store, no-cache, must-revalidate',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
-    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
     'Referrer-Policy': 'no-referrer',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=()',
+    'X-Permitted-Cross-Domain-Policies': 'none',
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
     ...extraHeaders,
   })
   response.end(JSON.stringify(value))
@@ -101,7 +129,7 @@ function setCors(request, response) {
   response.setHeader('Access-Control-Allow-Origin', origin)
   response.setHeader('Vary', 'Origin')
   response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type')
-  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS')
+  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
   response.setHeader('Access-Control-Max-Age', '600')
   return true
 }
@@ -160,8 +188,11 @@ function safeEqualHex(left, right) {
 }
 
 function hashPassword(password) {
+  if (typeof password !== 'string' || password.length < 8 || password.length > 128) {
+    throw new Error('Password must be between 8 and 128 characters.')
+  }
   const salt = randomBytes(16).toString('hex')
-  const derivedKey = scryptSync(password, salt, 64)
+  const derivedKey = scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 })
   return `scrypt$${salt}$${derivedKey.toString('hex')}`
 }
 
@@ -170,7 +201,7 @@ function verifyPassword(password, stored) {
   const parts = stored.split('$')
   if (parts.length !== 3) return false
   const [, salt, hash] = parts
-  const derivedKey = scryptSync(password, salt, 64)
+  const derivedKey = scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 })
   const hashBuffer = Buffer.from(hash, 'hex')
   if (derivedKey.length !== hashBuffer.length) return false
   return timingSafeEqual(derivedKey, hashBuffer)
@@ -237,8 +268,17 @@ function profileFromChallenge(challenge, userId, id = randomUUID()) {
 }
 
 async function handleOtpRequest(request, response, database) {
+  const ip = getClientIp(request)
+  const ipLimit = checkRateLimit(`otp-req-ip:${ip}`, 10, 15 * 60 * 1000)
+  if (!ipLimit.ok) {
+    return json(response, 429, { error: 'Too many verification requests from this network. Wait 15 minutes.' }, { 'Retry-After': String(ipLimit.resetInSeconds) })
+  }
   const body = await readJson(request)
   const email = cleanEmail(body.email)
+  const emailLimit = checkRateLimit(`otp-req-email:${email}`, 5, 15 * 60 * 1000)
+  if (!emailLimit.ok) {
+    return json(response, 429, { error: 'Too many verification requests for this email address. Wait 15 minutes.' }, { 'Retry-After': String(emailLimit.resetInSeconds) })
+  }
   const fullName = cleanText(body.fullName, 100)
   const purpose = body.purpose === 'profile' ? 'profile' : 'account'
   const profileName = cleanText(body.profileName, 60)
@@ -278,6 +318,11 @@ async function handleOtpRequest(request, response, database) {
 }
 
 async function handleOtpVerify(request, response, body, database) {
+  const ip = getClientIp(request)
+  const ipLimit = checkRateLimit(`otp-verify-ip:${ip}`, 25, 15 * 60 * 1000)
+  if (!ipLimit.ok) {
+    return json(response, 429, { error: 'Too many verification attempts from this network. Wait 15 minutes.' }, { 'Retry-After': String(ipLimit.resetInSeconds) })
+  }
   const email = cleanEmail(body.email)
   const id = cleanText(body.challengeId, 80)
   const code = typeof body.code === 'string' ? body.code.replace(/\D/g, '') : ''
@@ -382,10 +427,19 @@ async function handleConsent(request, response, body, database) {
 }
 
 async function handlePasswordLogin(request, response, body, database) {
+  const ip = getClientIp(request)
+  const ipLimit = checkRateLimit(`login-ip:${ip}`, 20, 15 * 60 * 1000)
+  if (!ipLimit.ok) {
+    return json(response, 429, { error: 'Too many login attempts from this network. Wait 15 minutes.' }, { 'Retry-After': String(ipLimit.resetInSeconds) })
+  }
   const email = cleanEmail(body.email)
   const password = typeof body.password === 'string' ? body.password : ''
-  if (!EMAIL_PATTERN.test(email) || !password) {
+  if (!EMAIL_PATTERN.test(email) || !password || password.length > 128) {
     return json(response, 400, { error: 'Enter your email address and password.' })
+  }
+  const emailLimit = checkRateLimit(`login-email:${email}`, 10, 15 * 60 * 1000)
+  if (!emailLimit.ok) {
+    return json(response, 429, { error: 'Too many failed login attempts for this account. Wait 15 minutes.' }, { 'Retry-After': String(emailLimit.resetInSeconds) })
   }
   const user = await database.get('SELECT id, email, full_name, password_hash, consented_at FROM users WHERE email = ?', email)
   if (!user || !user.password_hash || !verifyPassword(password, user.password_hash)) {
@@ -404,6 +458,73 @@ async function handlePasswordLogin(request, response, body, database) {
     },
     profiles,
     activeProfileId: profiles[0]?.id,
+  })
+}
+
+async function handleAccountDeletion(request, response, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in to delete your account.' })
+
+  await database.transaction(async (tx) => {
+    await tx.run('DELETE FROM encrypted_snapshots WHERE profile_id IN (SELECT id FROM profiles WHERE user_id = ?)', user.id)
+    await tx.run('DELETE FROM profiles WHERE user_id = ?', user.id)
+    await tx.run('DELETE FROM access_tokens WHERE user_id = ?', user.id)
+    await tx.run('DELETE FROM otp_challenges WHERE email = ?', user.email)
+    await tx.run('DELETE FROM users WHERE id = ?', user.id)
+  })
+
+  return json(response, 200, {
+    ok: true,
+    message: 'Your account and all associated encrypted cloud data have been permanently erased.',
+  })
+}
+
+async function handleConsentWithdrawal(request, response, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in to manage consents.' })
+
+  await database.transaction(async (tx) => {
+    await tx.run('DELETE FROM encrypted_snapshots WHERE profile_id IN (SELECT id FROM profiles WHERE user_id = ?)', user.id)
+    const now = Date.now()
+    const withdrawnRecord = JSON.stringify({ withdrawn: true, withdrawnAt: now })
+    await tx.run('UPDATE users SET consented_at = NULL, consents_json = ? WHERE id = ?', withdrawnRecord, user.id)
+  })
+
+  return json(response, 200, {
+    ok: true,
+    message: 'Consent has been withdrawn and cloud snapshots have been erased.',
+  })
+}
+
+async function handleDataExport(request, response, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in to export data.' })
+
+  const profiles = await getProfiles(user.id, database)
+  const fullUser = await database.get('SELECT id, email, full_name, consented_at, consent_version, consents_json, created_at FROM users WHERE id = ?', user.id)
+
+  return json(response, 200, {
+    format: 'FinGrow Personal Data Export',
+    version: '1.0',
+    exportedAt: new Date().toISOString(),
+    compliance: 'Indian DPDP Act 2023 / GDPR Article 20',
+    account: {
+      id: fullUser.id,
+      email: fullUser.email,
+      fullName: fullUser.full_name,
+      createdAt: new Date(Number(fullUser.created_at)).toISOString(),
+      consentedAt: fullUser.consented_at ? new Date(Number(fullUser.consented_at)).toISOString() : null,
+      consentVersion: fullUser.consent_version,
+      consents: fullUser.consents_json ? JSON.parse(fullUser.consents_json) : null,
+    },
+    profiles: profiles.map((p) => ({
+      id: p.id,
+      name: p.name,
+      kind: p.kind,
+      currency: p.currency,
+      createdAt: new Date(Number(p.createdAt)).toISOString(),
+    })),
+    note: 'Financial balances and transactions are encrypted on your local device under your master key (Zero-Knowledge Architecture).',
   })
 }
 
@@ -458,6 +579,15 @@ async function route(request, response, database) {
     const match = /^Bearer ([A-Za-z0-9_-]{32,128})$/.exec(request.headers.authorization || '')
     if (match) await database.run('DELETE FROM access_tokens WHERE token_hash = ?', tokenHash(match[1]))
     return json(response, 200, { ok: true })
+  }
+  if (request.method === 'DELETE' && (pathname === '/v1/auth/me' || pathname === '/v1/auth/account')) {
+    return handleAccountDeletion(request, response, database)
+  }
+  if (request.method === 'POST' && pathname === '/v1/auth/consent/withdraw') {
+    return handleConsentWithdrawal(request, response, database)
+  }
+  if (request.method === 'GET' && pathname === '/v1/auth/export') {
+    return handleDataExport(request, response, database)
   }
 
   const profileRoute = /^\/v1\/profiles\/([A-Za-z0-9_-]{1,80})\/snapshot$/.exec(pathname)
