@@ -41,7 +41,7 @@ export function backendBaseUrl(): string {
     const saved = localStorage.getItem('fingrow_backend_url')?.trim()
     if (saved) return secureBaseUrl(saved)
   }
-  return 'http://127.0.0.1:4317'
+  return 'https://fingrow-backend-thrytes.vercel.app'
 }
 
 function secureBaseUrl(value: string): string {

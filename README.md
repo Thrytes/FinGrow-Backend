@@ -54,11 +54,11 @@ After Vercel gives you the deployment URL, use its HTTPS origin as `FINGROW_BACK
 
 ```powershell
 # Desktop: run from desktop/ to produce the Windows installer
-$env:FINGROW_BACKEND_URL = 'https://your-backend.vercel.app'
+$env:FINGROW_BACKEND_URL = 'https://fingrow-backend-thrytes.vercel.app'
 .\node_modules\.bin\tauri.cmd build
 
 # Android: run from mobile/
-flutter build apk --release --dart-define=FINGROW_BACKEND_URL=https://your-backend.vercel.app
+flutter build apk --release --dart-define=FINGROW_BACKEND_URL=https://fingrow-backend-thrytes.vercel.app
 ```
 
 The Tauri content policy permits Vercel HTTPS domains and local development. The Android client rejects HTTP URLs outside emulator/loopback development. If you later use a custom desktop backend domain, add that domain to `desktop/src-tauri/tauri.conf.json`'s `connect-src` policy before rebuilding.
