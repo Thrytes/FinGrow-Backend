@@ -67,14 +67,30 @@ The Tauri content policy permits Vercel HTTPS domains and local development. The
 
 Vercel limits function requests and responses to 4.5 MB. The API applies a 4 MiB JSON body cap and a 3 MiB encrypted-envelope cap in Vercel mode to leave room for JSON/base64 overhead. Keep receipt snapshots below this limit for cross-device testing. Larger receipt files will need direct object-storage upload support before relying on Vercel for them.
 
-## API
+## API & Endpoints
 
 - `GET /health` — checks database initialization and reports whether SMTP settings are present.
-- `POST /v1/auth/otp/request` — sends a 6-digit code; limited to three requests per address every 15 minutes.
-- `POST /v1/auth/otp/verify` — consumes a code once and issues a bearer token.
-- `GET /v1/auth/me` — returns the authenticated user's profiles.
-- `POST /v1/auth/logout` — revokes the bearer token.
-- `GET /v1/profiles/:id/snapshot` — reads the encrypted profile snapshot and revision.
-- `PUT /v1/profiles/:id/snapshot` — writes only when `expectedRevision` matches; stale writes return `409`.
+- `POST /v1/auth/otp/request` — sends a 6-digit email OTP (rate-limited via sliding window; max 5 requests per 10 minutes per IP/email).
+- `POST /v1/auth/otp/verify` — verifies 6-digit code, provisions user with scrypt password hash and consent records, and issues bearer token (max 10 attempts per 10 minutes).
+- `POST /v1/auth/login` — verifies user credentials via OWASP-recommended `scrypt` hashing with unique salt and constant-time timing-safe comparison (max 10 attempts per 10 minutes).
+- `GET /v1/auth/me` — returns the authenticated user's profile metadata and registered profiles.
+- `POST /v1/auth/logout` — revokes the bearer token session.
+- `DELETE /v1/auth/me` — **Right to Erasure (DPDP Act 2023 / GDPR Art. 17)**: permanently deletes user account, profiles, tokens, pending challenges, and all encrypted cloud snapshots.
+- `POST /v1/auth/consent/withdraw` — **Consent Revocation**: deletes cloud backup snapshots and updates user consent flags.
+- `GET /v1/auth/export` — **Right to Data Portability (DPDP Act 2023 / GDPR Art. 20)**: exports user account, registered profiles, and consent audit logs in structured JSON format.
+- `GET /v1/profiles/:id/snapshot` — reads the zero-knowledge encrypted profile snapshot and revision.
+- `PUT /v1/profiles/:id/snapshot` — atomic writes with `expectedRevision` check; stale writes return `409 Conflict`.
+
+## Security & Compliance Architecture
+
+- **Zero-Knowledge Encryption**: Master passwords and unencrypted financial records are never transmitted. Financial snapshots are encrypted client-side using AES-256-GCM with PBKDF2 / Argon2 keys derived locally.
+- **OWASP Password Hashing**: Passwords are saved using Node.js native `crypto.scrypt` with a cryptographically secure 16-byte salt and constant-time comparison.
+- **Sliding-Window Rate Limiting**: Dynamic IP and identifier tracking blocks brute-force credential stuffing and OTP spamming.
+- **Strict HTTP Security Headers**: Live responses enforce `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Permissions-Policy: interest-cohort=()`, and `Content-Security-Policy: default-src 'none'`.
+
+## Architecture & Integration Guides
+
+- [FINGROW_ARCHITECTURE_AND_SYNC_GUIDE.md](./FINGROW_ARCHITECTURE_AND_SYNC_GUIDE.md) — Comprehensive guide covering Desktop $\leftrightarrow$ Backend $\leftrightarrow$ Mobile sync, zero-knowledge encryption, SMS processing privacy boundaries, and offline-first vault mechanics.
+- [PRODUCTION_READINESS_HANDOFF.md](./PRODUCTION_READINESS_HANDOFF.md) — Production readiness audit, legal DPDP/GDPR compliance checklist, security verification, and performance benchmarks.
 
 Browser origins use the comma-separated `FINGROW_ALLOWED_ORIGINS` allowlist. Native Android requests do not use browser CORS. OTP registration requires a working SMTP connection. Sync uses the same master password across devices to derive the shared encryption key locally; it is never sent to the server.
