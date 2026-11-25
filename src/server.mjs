@@ -1,7 +1,10 @@
-import { createHmac, randomBytes, randomInt, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
+import { createHmac, randomBytes, randomInt, randomUUID, scrypt, timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
+import { promisify } from 'node:util'
 import { createStore } from './database.mjs'
+
+const scryptAsync = promisify(scrypt)
 
 const PORT = Number(process.env.FINGROW_BACKEND_PORT || 4317)
 const HOST = process.env.FINGROW_BACKEND_HOST || '127.0.0.1'
@@ -80,15 +83,26 @@ const mailer = smtpConfigured
 const rateLimits = new Map()
 
 function getClientIp(request) {
+  if (onVercel) {
+    const vercelIp = request.headers['x-real-ip'] || request.headers['x-vercel-forwarded-for']
+    if (typeof vercelIp === 'string' && vercelIp.trim()) {
+      return vercelIp.split(',')[0].trim()
+    }
+  }
   const forwarded = request.headers['x-forwarded-for']
-  if (typeof forwarded === 'string') {
+  if (typeof forwarded === 'string' && forwarded.trim()) {
     return forwarded.split(',')[0].trim()
   }
   return request.socket?.remoteAddress || '127.0.0.1'
 }
 
-function checkRateLimit(key, maxRequests, windowMs) {
+function checkMemoryRateLimit(key, maxRequests, windowMs) {
   const now = Date.now()
+  if (rateLimits.size > 5000) {
+    for (const [entryKey, entry] of rateLimits.entries()) {
+      if (entry.resetAt <= now) rateLimits.delete(entryKey)
+    }
+  }
   let record = rateLimits.get(key)
   if (!record || record.resetAt <= now) {
     record = { count: 1, resetAt: now + windowMs }
@@ -100,6 +114,34 @@ function checkRateLimit(key, maxRequests, windowMs) {
   }
   record.count += 1
   return { ok: true, remaining: maxRequests - record.count, resetInSeconds: Math.ceil((record.resetAt - now) / 1000) }
+}
+
+async function checkRateLimit(key, maxRequests, windowMs, database = null) {
+  if (!database) return checkMemoryRateLimit(key, maxRequests, windowMs)
+  const now = Date.now()
+  try {
+    return await database.transaction(async (tx) => {
+      const existing = await tx.get('SELECT count, reset_at FROM rate_limits WHERE key = ?', key)
+      if (!existing || Number(existing.reset_at) <= now) {
+        const nextReset = now + windowMs
+        await tx.run(
+          'INSERT INTO rate_limits (key, count, reset_at) VALUES (?, 1, ?) ON CONFLICT(key) DO UPDATE SET count = 1, reset_at = excluded.reset_at',
+          key,
+          nextReset,
+        )
+        return { ok: true, remaining: maxRequests - 1, resetInSeconds: Math.ceil(windowMs / 1000) }
+      }
+      const currentCount = Number(existing.count)
+      const resetAt = Number(existing.reset_at)
+      if (currentCount >= maxRequests) {
+        return { ok: false, remaining: 0, resetInSeconds: Math.max(1, Math.ceil((resetAt - now) / 1000)) }
+      }
+      await tx.run('UPDATE rate_limits SET count = ? WHERE key = ?', currentCount + 1, key)
+      return { ok: true, remaining: maxRequests - (currentCount + 1), resetInSeconds: Math.max(1, Math.ceil((resetAt - now) / 1000)) }
+    })
+  } catch {
+    return checkMemoryRateLimit(key, maxRequests, windowMs)
+  }
 }
 
 const json = (response, status, value, extraHeaders = {}) => {
@@ -121,9 +163,11 @@ const json = (response, status, value, extraHeaders = {}) => {
 function setCors(request, response) {
   const origin = request.headers.origin
   if (!origin) return true
+  const isDevLocal =
+    process.env.NODE_ENV !== 'production' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
   const isAllowed =
     allowedOrigins.has(origin) ||
-    /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
+    isDevLocal ||
     /^https?:\/\/tauri\.localhost(:\d+)?$/.test(origin)
   if (!isAllowed) return false
   response.setHeader('Access-Control-Allow-Origin', origin)
@@ -187,31 +231,46 @@ function safeEqualHex(left, right) {
   return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'))
 }
 
-function hashPassword(password) {
+async function hashPassword(password) {
   if (typeof password !== 'string' || password.length < 8 || password.length > 128) {
     throw new Error('Password must be between 8 and 128 characters.')
   }
   const salt = randomBytes(16).toString('hex')
-  const derivedKey = scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 })
-  return `scrypt$${salt}$${derivedKey.toString('hex')}`
+  const derivedKey = await scryptAsync(password, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 })
+  return `scrypt$${salt}$${Buffer.from(derivedKey).toString('hex')}`
 }
 
-function verifyPassword(password, stored) {
+async function verifyPassword(password, stored) {
   if (!stored || typeof stored !== 'string' || !stored.startsWith('scrypt$')) return false
   const parts = stored.split('$')
   if (parts.length !== 3) return false
   const [, salt, hash] = parts
-  const derivedKey = scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 })
+  if (!/^[0-9a-f]{32}$/i.test(salt) || !/^[0-9a-f]{128}$/i.test(hash)) return false
+  const derivedKey = Buffer.from(
+    await scryptAsync(password, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }),
+  )
   const hashBuffer = Buffer.from(hash, 'hex')
   if (derivedKey.length !== hashBuffer.length) return false
   return timingSafeEqual(derivedKey, hashBuffer)
+}
+
+function hasActiveCloudConsent(user) {
+  if (!user || !user.consented_at) return false
+  if (!user.consents_json) return false
+  try {
+    const parsed = JSON.parse(user.consents_json)
+    if (parsed?.withdrawn) return false
+    return Boolean(parsed?.encryptedCloudSync && parsed?.localVault)
+  } catch {
+    return false
+  }
 }
 
 async function authUser(request, database) {
   const match = /^Bearer ([A-Za-z0-9_-]{32,128})$/.exec(request.headers.authorization || '')
   if (!match) return null
   const digest = tokenHash(match[1])
-  const session = await database.get(`SELECT users.id, users.email, users.full_name
+  const session = await database.get(`SELECT users.id, users.email, users.full_name, users.consented_at, users.consents_json
       FROM access_tokens JOIN users ON users.id = access_tokens.user_id
       WHERE access_tokens.token_hash = ? AND access_tokens.expires_at > ?`, digest, Date.now())
   if (!session) return null
@@ -269,13 +328,13 @@ function profileFromChallenge(challenge, userId, id = randomUUID()) {
 
 async function handleOtpRequest(request, response, database) {
   const ip = getClientIp(request)
-  const ipLimit = checkRateLimit(`otp-req-ip:${ip}`, 10, 15 * 60 * 1000)
+  const ipLimit = await checkRateLimit(`otp-req-ip:${ip}`, 10, 15 * 60 * 1000, database)
   if (!ipLimit.ok) {
     return json(response, 429, { error: 'Too many verification requests from this network. Wait 15 minutes.' }, { 'Retry-After': String(ipLimit.resetInSeconds) })
   }
   const body = await readJson(request)
   const email = cleanEmail(body.email)
-  const emailLimit = checkRateLimit(`otp-req-email:${email}`, 5, 15 * 60 * 1000)
+  const emailLimit = await checkRateLimit(`otp-req-email:${email}`, 5, 15 * 60 * 1000, database)
   if (!emailLimit.ok) {
     return json(response, 429, { error: 'Too many verification requests for this email address. Wait 15 minutes.' }, { 'Retry-After': String(emailLimit.resetInSeconds) })
   }
@@ -293,6 +352,12 @@ async function handleOtpRequest(request, response, database) {
   if (purpose === 'profile' && !requestingUser) return json(response, 401, { error: 'Sign in before adding a profile.' })
   if (purpose === 'profile' && requestingUser.email.toLowerCase() !== email) {
     return json(response, 403, { error: 'Verify the email address already linked to this account.' })
+  }
+  if (purpose === 'account') {
+    const existingAccount = await database.get('SELECT id FROM users WHERE email = ?', email)
+    if (existingAccount) {
+      return json(response, 409, { error: 'That email is already registered. Sign in instead.' })
+    }
   }
   const recent = await database.get(
     'SELECT count(*) AS total FROM otp_challenges WHERE email = ? AND created_at > ?',
@@ -319,7 +384,7 @@ async function handleOtpRequest(request, response, database) {
 
 async function handleOtpVerify(request, response, body, database) {
   const ip = getClientIp(request)
-  const ipLimit = checkRateLimit(`otp-verify-ip:${ip}`, 25, 15 * 60 * 1000)
+  const ipLimit = await checkRateLimit(`otp-verify-ip:${ip}`, 25, 15 * 60 * 1000, database)
   if (!ipLimit.ok) {
     return json(response, 429, { error: 'Too many verification attempts from this network. Wait 15 minutes.' }, { 'Retry-After': String(ipLimit.resetInSeconds) })
   }
@@ -328,6 +393,15 @@ async function handleOtpVerify(request, response, body, database) {
   const code = typeof body.code === 'string' ? body.code.replace(/\D/g, '') : ''
   if (!EMAIL_PATTERN.test(email) || !id || !/^\d{6}$/.test(code)) {
     return json(response, 400, { error: 'Enter the complete 6-digit verification code.' })
+  }
+
+  const rawPassword = typeof body.password === 'string' && body.password.length >= 8 ? body.password : null
+  let precomputedPasswordHash = null
+  if (rawPassword) {
+    if (rawPassword.length > 128) {
+      return json(response, 400, { error: 'Password must be between 8 and 128 characters.' })
+    }
+    precomputedPasswordHash = await hashPassword(rawPassword)
   }
 
   try {
@@ -356,26 +430,24 @@ async function handleOtpVerify(request, response, body, database) {
       let user = await transaction.get('SELECT id, email, full_name, password_hash, consented_at FROM users WHERE email = ?', email)
       if (challenge.purpose === 'profile' && !user) throw new Error('Account not found.')
 
-      const rawPassword = typeof body.password === 'string' && body.password.length >= 8 ? body.password : null
-      const passwordHash = rawPassword ? hashPassword(rawPassword) : null
       const fullName = cleanText(body.fullName || challenge.full_name, 100) || 'FinGrow user'
 
       if (!user) {
+        if (!precomputedPasswordHash) {
+          return { status: 400, body: { error: 'A password between 8 and 128 characters is required to register.' } }
+        }
         user = { id: randomUUID(), email, full_name: fullName, consented_at: null }
         await transaction.run('INSERT INTO users (id, email, full_name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)',
-          user.id, user.email, user.full_name, passwordHash, Date.now())
+          user.id, user.email, user.full_name, precomputedPasswordHash, Date.now())
         const profile = profileFromChallenge(challenge, user.id)
         await transaction.run('INSERT INTO profiles (id, user_id, name, kind, currency, sync_salt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
           profile.id, profile.userId, profile.name, profile.kind, profile.currency, profile.syncSalt, profile.createdAt)
+      } else if (challenge.purpose === 'profile') {
+        const profile = profileFromChallenge(challenge, user.id, cleanText(body.profileId, 80) || randomUUID())
+        await transaction.run('INSERT INTO profiles (id, user_id, name, kind, currency, sync_salt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          profile.id, profile.userId, profile.name, profile.kind, profile.currency, profile.syncSalt, profile.createdAt)
       } else {
-        if (passwordHash) {
-          await transaction.run('UPDATE users SET password_hash = ? WHERE id = ?', passwordHash, user.id)
-        }
-        if (challenge.purpose === 'profile') {
-          const profile = profileFromChallenge(challenge, user.id, cleanText(body.profileId, 80) || randomUUID())
-          await transaction.run('INSERT INTO profiles (id, user_id, name, kind, currency, sync_salt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            profile.id, profile.userId, profile.name, profile.kind, profile.currency, profile.syncSalt, profile.createdAt)
-        }
+        return { status: 409, body: { error: 'That email is already registered. Sign in instead.' } }
       }
       const profiles = await getProfiles(user.id, transaction)
       const token = await issueToken(user.id, transaction)
@@ -428,7 +500,7 @@ async function handleConsent(request, response, body, database) {
 
 async function handlePasswordLogin(request, response, body, database) {
   const ip = getClientIp(request)
-  const ipLimit = checkRateLimit(`login-ip:${ip}`, 20, 15 * 60 * 1000)
+  const ipLimit = await checkRateLimit(`login-ip:${ip}`, 20, 15 * 60 * 1000, database)
   if (!ipLimit.ok) {
     return json(response, 429, { error: 'Too many login attempts from this network. Wait 15 minutes.' }, { 'Retry-After': String(ipLimit.resetInSeconds) })
   }
@@ -437,12 +509,12 @@ async function handlePasswordLogin(request, response, body, database) {
   if (!EMAIL_PATTERN.test(email) || !password || password.length > 128) {
     return json(response, 400, { error: 'Enter your email address and password.' })
   }
-  const emailLimit = checkRateLimit(`login-email:${email}`, 10, 15 * 60 * 1000)
+  const emailLimit = await checkRateLimit(`login-email:${email}`, 10, 15 * 60 * 1000, database)
   if (!emailLimit.ok) {
     return json(response, 429, { error: 'Too many failed login attempts for this account. Wait 15 minutes.' }, { 'Retry-After': String(emailLimit.resetInSeconds) })
   }
   const user = await database.get('SELECT id, email, full_name, password_hash, consented_at FROM users WHERE email = ?', email)
-  if (!user || !user.password_hash || !verifyPassword(password, user.password_hash)) {
+  if (!user || !user.password_hash || !(await verifyPassword(password, user.password_hash))) {
     return json(response, 401, { error: 'Incorrect email or password.' })
   }
   const profiles = await getProfiles(user.id, database)
@@ -594,6 +666,9 @@ async function route(request, response, database) {
   if (profileRoute && (request.method === 'GET' || request.method === 'PUT')) {
     const user = await authUser(request, database)
     if (!user) return json(response, 401, { error: 'Your sync session expired. Verify your email again to reconnect.' })
+    if (!hasActiveCloudConsent(user)) {
+      return json(response, 403, { error: 'Cloud sync consent is required or has been withdrawn.' })
+    }
     const profileId = profileRoute[1]
     const profile = await database.get('SELECT id FROM profiles WHERE id = ? AND user_id = ?', profileId, user.id)
     if (!profile) return json(response, 404, { error: 'Profile not found.' })
@@ -636,8 +711,15 @@ export async function handleBackendRequest(request, response, { requireRemote = 
     return await route(request, response, database)
   } catch (error) {
     const status = error.status || (String(error.message).includes('TURSO_DATABASE_URL') ? 503 : 500)
-    const message = error.message || 'The request could not be completed.'
-    if (!response.headersSent) return json(response, status, { error: message })
+    const requestId = randomUUID()
+    if (status >= 500) {
+      console.error(`[FinGrow Backend ${requestId}]`, error?.message || 'Internal error')
+    }
+    const message =
+      status >= 500 && !String(error.message || '').includes('TURSO_DATABASE_URL')
+        ? 'The request could not be completed.'
+        : error.message || 'The request could not be completed.'
+    if (!response.headersSent) return json(response, status, status >= 500 ? { error: message, requestId } : { error: message })
     response.destroy()
   }
 }

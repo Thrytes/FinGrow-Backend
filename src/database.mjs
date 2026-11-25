@@ -51,6 +51,11 @@ const schemaStatements = [
     envelope_json TEXT NOT NULL,
     updated_at INTEGER NOT NULL
   ) STRICT`,
+  `CREATE TABLE IF NOT EXISTS rate_limits (
+    key TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    reset_at INTEGER NOT NULL
+  ) STRICT`,
 ]
 
 class LocalSqliteStore {
