@@ -488,11 +488,16 @@ async function handleConsent(request, response, body, database) {
     return json(response, 400, { error: 'Essential cloud sync and local vault consents are required to use FinGrow.' })
   }
   const now = Date.now()
+  const normalizedConsents = {
+    transactionalSms: Boolean(consents.transactionalSms),
+    encryptedCloudSync: Boolean(consents.encryptedCloudSync),
+    localVault: Boolean(consents.localVault),
+  }
   await database.run(
     'UPDATE users SET consented_at = ?, consent_version = ?, consents_json = ? WHERE id = ?',
     now,
     version,
-    JSON.stringify(consents),
+    JSON.stringify(normalizedConsents),
     user.id,
   )
   return json(response, 200, { ok: true, consentedAt: new Date(now).toISOString() })
@@ -594,7 +599,7 @@ async function handleDataExport(request, response, database) {
       name: p.name,
       kind: p.kind,
       currency: p.currency,
-      createdAt: new Date(Number(p.createdAt)).toISOString(),
+      createdAt: p.createdAt,
     })),
     note: 'Financial balances and transactions are encrypted on your local device under your master key (Zero-Knowledge Architecture).',
   })
