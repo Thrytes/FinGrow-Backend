@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, randomInt, randomUUID, scrypt, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomInt, randomUUID, scrypt, timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { promisify } from 'node:util'
@@ -614,6 +614,256 @@ function validEnvelope(envelope) {
   return iv.length === 12 && ciphertext.length >= 16 && ciphertext.length <= ENVELOPE_LIMIT
 }
 
+const ALLOWED_SCAN_MIME_TYPES = new Set([
+  'application/pdf',
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+])
+
+function matchesMagicBytes(buffer, mimeType) {
+  if (buffer.length < 4) return false
+  if (mimeType === 'application/pdf') {
+    return buffer.subarray(0, 5).toString('ascii') === '%PDF-'
+  }
+  if (mimeType === 'image/png') {
+    return buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47
+  }
+  if (mimeType === 'image/jpeg') {
+    return buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff
+  }
+  if (mimeType === 'image/webp') {
+    return (
+      buffer.length >= 12 &&
+      buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+      buffer.subarray(8, 12).toString('ascii') === 'WEBP'
+    )
+  }
+  return false
+}
+
+function hasUnsafeEmbeddedPayload(buffer, mimeType) {
+  if (mimeType !== 'application/pdf') return false
+  const sample = buffer.subarray(0, Math.min(buffer.length, 512 * 1024)).toString('latin1')
+  return /\/(?:JavaScript|JS|Launch|OpenAction|AA|RichMedia)\b|<script\b/i.test(sample)
+}
+
+async function callGeminiJson(prompt, inlineData = null) {
+  const apiKey = process.env.GEMINI_API_KEY || ''
+  if (!apiKey) return null
+  const parts = [{ text: prompt }]
+  if (inlineData) {
+    parts.push({ inline_data: inlineData })
+  }
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
+      }),
+      signal: AbortSignal.timeout(8000),
+    },
+  )
+  if (!res.ok) return null
+  const data = await res.json()
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text
+  if (!text) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
+async function handleDocumentScan(request, response, body, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in online to scan and upload documents.' })
+  const limit = await checkRateLimit(`scan:${user.id}`, 20, 60 * 60 * 1000, database)
+  if (!limit.ok) return json(response, 429, { error: `Too many document scans. Wait ${limit.resetInSeconds}s.` })
+
+  const mimeType = cleanText(body.mimeType, 64).toLowerCase()
+  const base64Content = typeof body.base64Content === 'string' ? body.base64Content.trim() : ''
+  const maxBytes = onVercel ? 3 * 1024 * 1024 : 10 * 1024 * 1024
+  if (!ALLOWED_SCAN_MIME_TYPES.has(mimeType) || !base64Content) {
+    return json(response, 400, { error: 'Provide a valid PDF, PNG, JPG, or WebP document.' })
+  }
+  const buffer = Buffer.from(base64Content, 'base64')
+  if (!buffer.length || buffer.length > maxBytes) {
+    return json(response, 400, { error: 'Document exceeds the allowed scan size limit.' })
+  }
+  if (!matchesMagicBytes(buffer, mimeType)) {
+    return json(response, 422, { ok: false, safe: false, error: 'File contents do not match the declared file type.' })
+  }
+  if (hasUnsafeEmbeddedPayload(buffer, mimeType)) {
+    return json(response, 422, { ok: false, safe: false, error: 'Document failed security scan (active script or launch action detected).' })
+  }
+
+  let extracted = null
+  if (body.extractReceipt === true && mimeType.startsWith('image/')) {
+    extracted = await callGeminiJson(
+      'Extract receipt transaction fields as JSON: {"merchant": string|null, "amountMinor": number|null, "currency": "INR"|string, "occurredAt": string|null, "category": string|null}. Amount in minor units (paise/cents). Return null fields if unreadable.',
+      { mime_type: mimeType, data: base64Content },
+    )
+  }
+
+  const sha256 = createHash('sha256').update(buffer).digest('hex')
+  return json(response, 200, {
+    ok: true,
+    safe: true,
+    sha256,
+    mimeType,
+    sizeBytes: buffer.length,
+    scannedAt: new Date().toISOString(),
+    extracted,
+  })
+}
+
+function buildDeterministicInsights(metrics) {
+  const insights = []
+  const income = Math.max(0, Number(metrics.monthlyIncomeMinor) || 0)
+  const expense = Math.max(0, Number(metrics.monthlyExpenseMinor) || 0)
+  const overdue = Math.max(0, Number(metrics.overdueMinor) || 0)
+  const balance = Number(metrics.totalBalanceMinor) || 0
+
+  if (overdue > 0) {
+    insights.push({
+      title: 'Overdue obligation priority',
+      summary: `Clearing overdue dues (${Math.round(overdue / 100)} units) restores full cash-buffer health.`,
+      tone: 'warning',
+    })
+  }
+  if (income > 0) {
+    const savingsRate = Math.round(((income - expense) / income) * 100)
+    insights.push({
+      title: savingsRate >= 20 ? 'Healthy monthly savings rate' : 'Tight monthly cash flow',
+      summary: `Your recorded monthly surplus is ${savingsRate}% of income across ${Number(metrics.accountCount) || 0} accounts.`,
+      tone: savingsRate >= 20 ? 'positive' : 'neutral',
+    })
+  }
+  const top = Array.isArray(metrics.topCategories) ? metrics.topCategories[0] : null
+  if (top?.category && expense > 0) {
+    const share = Math.round((Number(top.amountMinor || 0) / expense) * 100)
+    insights.push({
+      title: `${cleanText(top.category, 40)} leads spending`,
+      summary: `${cleanText(top.category, 40)} accounts for ${share}% of your recorded expenses (liquid balance: ${Math.round(balance / 100)}).`,
+      tone: share >= 45 ? 'warning' : 'neutral',
+    })
+  }
+  if (!insights.length) {
+    insights.push({
+      title: 'Add activity for deeper AI signals',
+      summary: 'Record accounts and recent transactions to unlock personalized cash-flow guidance.',
+      tone: 'neutral',
+    })
+  }
+  return insights
+}
+
+async function handleAiInsights(request, response, body, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in online to generate AI insights.' })
+  const limit = await checkRateLimit(`ai:${user.id}`, 30, 60 * 60 * 1000, database)
+  if (!limit.ok) return json(response, 429, { error: `Too many AI insight requests. Wait ${limit.resetInSeconds}s.` })
+
+  const metrics = {
+    currency: cleanText(body.currency, 8) || 'INR',
+    totalBalanceMinor: Number(body.totalBalanceMinor) || 0,
+    monthlyIncomeMinor: Number(body.monthlyIncomeMinor) || 0,
+    monthlyExpenseMinor: Number(body.monthlyExpenseMinor) || 0,
+    overdueMinor: Number(body.overdueMinor) || 0,
+    accountCount: Number(body.accountCount) || 0,
+    cardCount: Number(body.cardCount) || 0,
+    topCategories: Array.isArray(body.topCategories) ? body.topCategories.slice(0, 5) : [],
+  }
+
+  let source = 'server-rules'
+  let insights = null
+  const aiResponse = await callGeminiJson(
+    `Given these anonymized personal finance totals (minor currency units): ${JSON.stringify(metrics)}. Return JSON {"insights":[{"title":string,"summary":string,"tone":"positive"|"neutral"|"warning"}]} with at most 3 concise actionable insights.`,
+  )
+  if (Array.isArray(aiResponse?.insights) && aiResponse.insights.length) {
+    source = 'gemini'
+    insights = aiResponse.insights.slice(0, 3).map((item) => ({
+      title: cleanText(item?.title, 80) || 'Insight',
+      summary: cleanText(item?.summary, 240) || '',
+      tone: ['positive', 'warning', 'neutral'].includes(item?.tone) ? item.tone : 'neutral',
+    }))
+  } else {
+    insights = buildDeterministicInsights(metrics)
+  }
+
+  return json(response, 200, { ok: true, source, generatedAt: new Date().toISOString(), insights })
+}
+
+function guessSmsCategory(text) {
+  const lower = text.toLowerCase()
+  if (lower.includes('swiggy') || lower.includes('zomato') || lower.includes('cafe') || lower.includes('restaurant')) return 'Food'
+  if (lower.includes('uber') || lower.includes('ola') || lower.includes('metro') || lower.includes('fuel') || lower.includes('petrol')) return 'Transport'
+  if (lower.includes('amazon') || lower.includes('flipkart') || lower.includes('mart') || lower.includes('store')) return 'Shopping'
+  if (lower.includes('electricity') || lower.includes('bill') || lower.includes('recharge') || lower.includes('broadband')) return 'Bills'
+  if (lower.includes('salary') || lower.includes('payroll')) return 'Salary'
+  if (lower.includes('upi') || lower.includes('imps') || lower.includes('neft')) return 'Transfer'
+  return 'General'
+}
+
+function parseSingleTransactionSms(entry, cutoffMs) {
+  const body = cleanText(entry?.body, 600)
+  const sender = cleanText(entry?.sender, 64)
+  if (!body || body.length < 12) return null
+  const receivedMs = entry?.receivedAt ? new Date(entry.receivedAt).getTime() : Date.now()
+  if (!Number.isFinite(receivedMs) || receivedMs < cutoffMs) return null
+
+  const lower = body.toLowerCase()
+  const isDebit = /\b(debited|spent|paid|withdrawn|purchase|sent)\b/.test(lower)
+  const isCredit = /\b(credited|received|deposited|refund)\b/.test(lower)
+  if (!isDebit && !isCredit) return null
+
+  const amountMatch = /(?:rs\.?|inr|₹)\s*([0-9][0-9,]{0,12}(?:\.[0-9]{1,2})?)/i.exec(body)
+  if (!amountMatch) return null
+  const amountValue = Number(amountMatch[1].replaceAll(',', ''))
+  if (!Number.isFinite(amountValue) || amountValue <= 0) return null
+
+  const amountMinor = Math.round(amountValue * 100)
+  const acctMatch = /(?:a\/c|acct|account|card)\s*(?:no\.?\s*)?[xX*]*([0-9]{4})/i.exec(body)
+  const occurredAt = new Date(receivedMs).toISOString()
+  const referenceId = createHash('sha256')
+    .update(`${sender}:${occurredAt}:${amountMinor}:${body.slice(0, 60)}`)
+    .digest('hex')
+    .slice(0, 16)
+
+  return {
+    referenceId,
+    type: isDebit && !isCredit ? 'expense' : 'income',
+    amountMinor,
+    currency: 'INR',
+    accountHint: acctMatch ? acctMatch[1] : null,
+    sender: sender || 'Bank SMS',
+    category: guessSmsCategory(body),
+    occurredAt,
+  }
+}
+
+async function handleMobileSmsParse(request, response, body, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in to parse transactional SMS.' })
+  const limit = await checkRateLimit(`sms:${user.id}`, 30, 60 * 60 * 1000, database)
+  if (!limit.ok) return json(response, 429, { error: `Too many SMS parse requests. Wait ${limit.resetInSeconds}s.` })
+
+  const messages = Array.isArray(body.messages) ? body.messages.slice(0, 200) : []
+  const cutoffMs = Date.now() - 7 * 24 * 60 * 60 * 1000
+  const parsed = []
+  let skippedCount = 0
+  for (const entry of messages) {
+    const item = parseSingleTransactionSms(entry, cutoffMs)
+    if (item) parsed.push(item)
+    else skippedCount += 1
+  }
+  return json(response, 200, { ok: true, parsed, skippedCount })
+}
+
 async function route(request, response, database) {
   if (!setCors(request, response)) return json(response, 403, { error: 'This app origin is not allowed.' })
   if (request.method === 'OPTIONS') {
@@ -665,6 +915,15 @@ async function route(request, response, database) {
   }
   if (request.method === 'GET' && pathname === '/v1/auth/export') {
     return handleDataExport(request, response, database)
+  }
+  if (request.method === 'POST' && pathname === '/v1/documents/scan') {
+    return handleDocumentScan(request, response, await readJson(request), database)
+  }
+  if (request.method === 'POST' && pathname === '/v1/insights/ai') {
+    return handleAiInsights(request, response, await readJson(request), database)
+  }
+  if (request.method === 'POST' && pathname === '/v1/mobile/sms/parse') {
+    return handleMobileSmsParse(request, response, await readJson(request), database)
   }
 
   const profileRoute = /^\/v1\/profiles\/([A-Za-z0-9_-]{1,80})\/snapshot$/.exec(pathname)
