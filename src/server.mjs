@@ -864,6 +864,328 @@ async function handleMobileSmsParse(request, response, body, database) {
   return json(response, 200, { ok: true, parsed, skippedCount })
 }
 
+const MARKET_CACHE_TTL_MS = 5 * 60 * 1000
+const marketQuoteCache = new Map()
+const ALLOWED_REPORT_MIME_TYPES = new Set([
+  'application/pdf',
+  'text/csv',
+  'text/plain',
+  'application/json',
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+])
+
+function toYahooSymbol(symbol, exchange = '') {
+  const clean = cleanText(symbol, 40).toUpperCase()
+  if (!clean) return ''
+  if (clean.includes('.') || clean.includes('=')) return clean
+  const ex = cleanText(exchange, 16).toUpperCase()
+  if (ex === 'NSE' || clean.endsWith(':NSE')) return `${clean.replace(':NSE', '')}.NS`
+  if (ex === 'BSE' || clean.endsWith(':BSE')) return `${clean.replace(':BSE', '')}.BO`
+  if (clean.includes(':')) return clean.split(':')[0]
+  return clean
+}
+
+function inferAssetTypeFromQuote(item) {
+  const type = String(item?.quoteType || '').toUpperCase()
+  const name = String(item?.shortname || item?.longname || '').toLowerCase()
+  if (name.includes('gold')) return 'gold'
+  if (type === 'ETF') return 'etf'
+  if (type === 'MUTUALFUND') return 'mf'
+  if (name.includes('bond') || name.includes('g-sec') || name.includes('treasury')) return 'bond'
+  return 'stock'
+}
+
+async function fetchYahooQuote(yahooSymbol) {
+  const res = await fetch(
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1d&range=2d`,
+    {
+      headers: { 'User-Agent': 'FinGrow/1.0', Accept: 'application/json' },
+      signal: AbortSignal.timeout(5000),
+    },
+  )
+  if (!res.ok) return null
+  const data = await res.json()
+  const meta = data?.chart?.result?.[0]?.meta
+  const price = Number(meta?.regularMarketPrice)
+  if (!Number.isFinite(price) || price <= 0) return null
+  const prevClose = Number(meta?.chartPreviousClose || meta?.previousClose || price)
+  const changePct = prevClose > 0 ? Number((((price - prevClose) / prevClose) * 100).toFixed(2)) : 0
+  return {
+    priceMinor: Math.round(price * 100),
+    previousCloseMinor: Math.round(prevClose * 100),
+    changePct,
+    currency: cleanText(meta?.currency, 8) || 'INR',
+    quoteType: meta?.marketState === 'REGULAR' ? 'live' : 'eod',
+    effectiveAt: meta?.regularMarketTime
+      ? new Date(Number(meta.regularMarketTime) * 1000).toISOString()
+      : new Date().toISOString(),
+    source: 'yahoo',
+  }
+}
+
+async function fetchMfNav(schemeCode) {
+  const res = await fetch(`https://api.mfapi.in/mf/${encodeURIComponent(String(schemeCode))}/latest`, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(5000),
+  })
+  if (!res.ok) return null
+  const data = await res.json()
+  const latest = Array.isArray(data?.data) ? data.data[0] : null
+  const nav = Number(latest?.nav)
+  if (!Number.isFinite(nav) || nav <= 0) return null
+  return {
+    priceMinor: Math.round(nav * 100),
+    previousCloseMinor: Math.round(nav * 100),
+    changePct: 0,
+    currency: 'INR',
+    quoteType: 'eod',
+    effectiveAt: new Date().toISOString(),
+    source: 'mfapi',
+  }
+}
+
+async function handleMarketSearch(request, response, url, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in online to search market instruments.' })
+  const limit = await checkRateLimit(`market-search:${user.id}`, 60, 60 * 60 * 1000, database)
+  if (!limit.ok) return json(response, 429, { error: `Too many market searches. Wait ${limit.resetInSeconds}s.` })
+
+  const query = cleanText(url.searchParams.get('q'), 80)
+  const kind = cleanText(url.searchParams.get('kind'), 16).toLowerCase() || 'all'
+  if (query.length < 2) return json(response, 200, { ok: true, results: [] })
+
+  const results = []
+  const wantYahoo = kind === 'all' || kind === 'stock' || kind === 'etf' || kind === 'gold' || kind === 'bond'
+  const wantMf = kind === 'all' || kind === 'mf'
+
+  const tasks = []
+  if (wantYahoo) {
+    tasks.push(
+      fetch(
+        `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(query)}&quotesCount=8&newsCount=0`,
+        { headers: { 'User-Agent': 'FinGrow/1.0', Accept: 'application/json' }, signal: AbortSignal.timeout(5000) },
+      )
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          const quotes = Array.isArray(data?.quotes) ? data.quotes : []
+          for (const item of quotes.slice(0, 8)) {
+            if (!item?.symbol) continue
+            const assetType = inferAssetTypeFromQuote(item)
+            if (kind !== 'all' && kind !== assetType) continue
+            results.push({
+              symbol: String(item.symbol),
+              name: cleanText(item.shortname || item.longname || item.symbol, 120),
+              assetType,
+              exchange: cleanText(item.exchDisp || item.exchange || 'NSE', 20),
+              currency: String(item.symbol).endsWith('.NS') || String(item.symbol).endsWith('.BO') ? 'INR' : 'USD',
+            })
+          }
+        })
+        .catch(() => {}),
+    )
+  }
+  if (wantMf) {
+    tasks.push(
+      fetch(`https://api.mfapi.in/mf/search?q=${encodeURIComponent(query)}`, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(5000),
+      })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          const rows = Array.isArray(data) ? data : []
+          for (const row of rows.slice(0, 8)) {
+            if (!row?.schemeCode || !row?.schemeName) continue
+            results.push({
+              symbol: `MF:${row.schemeCode}`,
+              name: cleanText(row.schemeName, 140),
+              assetType: 'mf',
+              exchange: 'AMFI',
+              currency: 'INR',
+              schemeCode: String(row.schemeCode),
+            })
+          }
+        })
+        .catch(() => {}),
+    )
+  }
+
+  await Promise.all(tasks)
+  return json(response, 200, { ok: true, results: results.slice(0, 15) })
+}
+
+async function handleMarketQuotes(request, response, body, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in online to fetch live market quotes.' })
+  const limit = await checkRateLimit(`market-quotes:${user.id}`, 60, 60 * 60 * 1000, database)
+  if (!limit.ok) return json(response, 429, { error: `Too many quote refreshes. Wait ${limit.resetInSeconds}s.` })
+
+  const instruments = Array.isArray(body.instruments) ? body.instruments.slice(0, 50) : []
+  const now = Date.now()
+  const quotes = {}
+
+  await Promise.all(
+    instruments.map(async (inst) => {
+      const symbol = cleanText(inst?.symbol, 50)
+      if (!symbol) return
+      const cacheKey = `${symbol}|${cleanText(inst?.schemeCode, 20)}`
+      const cached = marketQuoteCache.get(cacheKey)
+      if (cached && now - cached.cachedAt < MARKET_CACHE_TTL_MS) {
+        quotes[symbol] = { ...cached.quote, cached: true }
+        return
+      }
+      let quote = null
+      try {
+        if (inst?.assetType === 'mf' && inst?.schemeCode) {
+          quote = await fetchMfNav(inst.schemeCode)
+        } else {
+          const yahooSym = toYahooSymbol(symbol, inst?.exchange)
+          if (yahooSym) quote = await fetchYahooQuote(yahooSym)
+        }
+      } catch {
+        quote = null
+      }
+      if (quote) {
+        const entry = { symbol, ...quote }
+        marketQuoteCache.set(cacheKey, { quote: entry, cachedAt: now })
+        quotes[symbol] = entry
+      }
+    }),
+  )
+
+  const fxRates = { INR: 1, USD: 84.5, EUR: 91.0 }
+  try {
+    const usdInr = await fetchYahooQuote('USDINR=X')
+    if (usdInr?.priceMinor) fxRates.USD = Number((usdInr.priceMinor / 100).toFixed(4))
+  } catch {}
+
+  return json(response, 200, {
+    ok: true,
+    fetchedAt: new Date().toISOString(),
+    fxRates,
+    quotes,
+  })
+}
+
+function normalizeReportAssetType(raw) {
+  const v = String(raw || '').toLowerCase()
+  if (v.includes('mutual') || v === 'mf') return 'mf'
+  if (v.includes('gold')) return 'gold'
+  if (v.includes('etf')) return 'etf'
+  if (v.includes('bond') || v.includes('g-sec') || v.includes('fd') || v.includes('debenture')) return 'bond'
+  return 'stock'
+}
+
+function parseCsvOrTextReport(text) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  const holdings = []
+  const transactions = []
+  for (const line of lines.slice(0, 300)) {
+    const cols = line.split(',').map((c) => c.trim().replaceAll('"', ''))
+    if (cols.length < 3) continue
+    const first = cols[0].toLowerCase()
+    if (first === 'symbol' || first === 'instrument' || first === 'name' || first === 'date') continue
+    const qty = Number(cols[1])
+    const price = Number(cols[2])
+    if (Number.isFinite(qty) && qty > 0 && Number.isFinite(price) && price > 0) {
+      const symbol = cleanText(cols[0], 50).toUpperCase()
+      const assetType = normalizeReportAssetType(cols[3] || 'stock')
+      const priceMinor = Math.round(price * 100)
+      holdings.push({
+        symbol,
+        name: cleanText(cols[4] || symbol, 100),
+        assetType,
+        exchange: assetType === 'mf' ? 'AMFI' : 'NSE',
+        currency: 'INR',
+        quantity: qty,
+        avgPriceMinor: priceMinor,
+        currentPriceMinor: priceMinor,
+      })
+      transactions.push({
+        symbol,
+        assetType,
+        action: 'buy',
+        quantity: qty,
+        priceMinor,
+        currency: 'INR',
+        occurredAt: new Date().toISOString(),
+        source: 'report-import',
+      })
+    }
+  }
+  return { holdings, transactions }
+}
+
+async function handleImportInvestmentReport(request, response, body, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in online to upload and scan investment reports.' })
+  const limit = await checkRateLimit(`import-report:${user.id}`, 20, 60 * 60 * 1000, database)
+  if (!limit.ok) return json(response, 429, { error: `Too many report imports. Wait ${limit.resetInSeconds}s.` })
+
+  const mimeType = cleanText(body.mimeType, 64).toLowerCase()
+  const reportType = cleanText(body.reportType, 24).toLowerCase() || 'cas'
+  const base64Content = typeof body.base64Content === 'string' ? body.base64Content.trim() : ''
+  const maxBytes = onVercel ? 3 * 1024 * 1024 : 10 * 1024 * 1024
+  if (!ALLOWED_REPORT_MIME_TYPES.has(mimeType) || !base64Content) {
+    return json(response, 400, { error: 'Upload a valid CAS/broker PDF, CSV, TXT, JSON, or image report.' })
+  }
+  const buffer = Buffer.from(base64Content, 'base64')
+  if (!buffer.length || buffer.length > maxBytes) {
+    return json(response, 400, { error: 'Report exceeds the allowed upload size limit.' })
+  }
+  if (ALLOWED_SCAN_MIME_TYPES.has(mimeType) && !matchesMagicBytes(buffer, mimeType)) {
+    return json(response, 422, { ok: false, safe: false, error: 'File contents do not match its declared type.' })
+  }
+  if (hasUnsafeEmbeddedPayload(buffer, mimeType)) {
+    return json(response, 422, { ok: false, safe: false, error: 'Report failed security scan (active script or launch action detected).' })
+  }
+
+  let holdings = []
+  let transactions = []
+  const warnings = []
+
+  if (mimeType === 'text/csv' || mimeType === 'text/plain') {
+    const parsed = parseCsvOrTextReport(buffer.toString('utf8'))
+    holdings = parsed.holdings
+    transactions = parsed.transactions
+  } else if (mimeType === 'application/json') {
+    try {
+      const obj = JSON.parse(buffer.toString('utf8'))
+      if (Array.isArray(obj?.holdings)) holdings = obj.holdings.slice(0, 200)
+      if (Array.isArray(obj?.transactions)) transactions = obj.transactions.slice(0, 500)
+    } catch {
+      warnings.push('Could not parse JSON report structure.')
+    }
+  } else {
+    const aiParsed = await callGeminiJson(
+      'Extract investment holdings and buy/sell/SIP transactions from this CAS or broker statement. Return JSON {"holdings":[{"symbol":string,"name":string,"assetType":"stock"|"mf"|"etf"|"gold"|"bond","quantity":number,"avgPriceMinor":number,"currentPriceMinor":number}],"transactions":[{"symbol":string,"assetType":"stock"|"mf"|"etf"|"gold"|"bond","action":"buy"|"sell"|"sip"|"dividend","quantity":number,"priceMinor":number,"occurredAt":string}]}. Amounts in minor units (paise).',
+      { mime_type: mimeType, data: base64Content },
+    )
+    if (aiParsed && (Array.isArray(aiParsed.holdings) || Array.isArray(aiParsed.transactions))) {
+      holdings = Array.isArray(aiParsed.holdings) ? aiParsed.holdings.slice(0, 200) : []
+      transactions = Array.isArray(aiParsed.transactions) ? aiParsed.transactions.slice(0, 500) : []
+    } else {
+      warnings.push('Document passed security scan. Configure GEMINI_API_KEY on backend for automatic PDF/image CAS extraction, or upload a CSV/JSON export.')
+    }
+  }
+
+  const sha256 = createHash('sha256').update(buffer).digest('hex')
+  return json(response, 200, {
+    ok: true,
+    safe: true,
+    sha256,
+    reportType,
+    scannedAt: new Date().toISOString(),
+    holdings,
+    transactions,
+    warnings,
+  })
+}
+
 async function route(request, response, database) {
   if (!setCors(request, response)) return json(response, 403, { error: 'This app origin is not allowed.' })
   if (request.method === 'OPTIONS') {
@@ -924,6 +1246,15 @@ async function route(request, response, database) {
   }
   if (request.method === 'POST' && pathname === '/v1/mobile/sms/parse') {
     return handleMobileSmsParse(request, response, await readJson(request), database)
+  }
+  if (request.method === 'GET' && pathname === '/v1/market/search') {
+    return handleMarketSearch(request, response, url, database)
+  }
+  if (request.method === 'POST' && pathname === '/v1/market/quotes') {
+    return handleMarketQuotes(request, response, await readJson(request), database)
+  }
+  if (request.method === 'POST' && pathname === '/v1/investments/import-report') {
+    return handleImportInvestmentReport(request, response, await readJson(request), database)
   }
 
   const profileRoute = /^\/v1\/profiles\/([A-Za-z0-9_-]{1,80})\/snapshot$/.exec(pathname)
