@@ -647,6 +647,26 @@ function hasUnsafeEmbeddedPayload(buffer, mimeType) {
   return /\/(?:JavaScript|JS|Launch|OpenAction|AA|RichMedia)\b|<script\b/i.test(sample)
 }
 
+async function callOllamaJson(prompt) {
+  const ollamaUrl = process.env.OLLAMA_BASE_URL || (onVercel ? '' : 'http://127.0.0.1:11434')
+  if (!ollamaUrl) return null
+  const model = process.env.OLLAMA_MODEL || 'llama3.2'
+  try {
+    const res = await fetch(`${ollamaUrl.replace(/\/+$/, '')}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, prompt, format: 'json', stream: false }),
+      signal: AbortSignal.timeout(4000),
+    })
+    if (!res.ok) return null
+    const data = await res.json()
+    if (!data?.response) return null
+    return JSON.parse(data.response)
+  } catch {
+    return null
+  }
+}
+
 async function callGeminiJson(prompt, inlineData = null) {
   const apiKey = process.env.GEMINI_API_KEY || ''
   if (!apiKey) return null
@@ -763,8 +783,8 @@ function buildDeterministicInsights(metrics) {
 
 async function handleAiInsights(request, response, body, database) {
   const user = await authUser(request, database)
-  if (!user) return json(response, 401, { error: 'Sign in online to generate AI insights.' })
-  const limit = await checkRateLimit(`ai:${user.id}`, 30, 60 * 60 * 1000, database)
+  const actorKey = user ? user.id : getClientIp(request)
+  const limit = await checkRateLimit(`ai:${actorKey}`, 30, 60 * 60 * 1000, database)
   if (!limit.ok) return json(response, 429, { error: `Too many AI insight requests. Wait ${limit.resetInSeconds}s.` })
 
   const metrics = {
@@ -780,11 +800,11 @@ async function handleAiInsights(request, response, body, database) {
 
   let source = 'server-rules'
   let insights = null
-  const aiResponse = await callGeminiJson(
-    `Given these anonymized personal finance totals (minor currency units): ${JSON.stringify(metrics)}. Return JSON {"insights":[{"title":string,"summary":string,"tone":"positive"|"neutral"|"warning"}]} with at most 3 concise actionable insights.`,
-  )
+  const prompt = `Given these anonymized personal finance totals (minor currency units): ${JSON.stringify(metrics)}. Return JSON {"insights":[{"title":string,"summary":string,"tone":"positive"|"neutral"|"warning"}]} with at most 3 concise actionable insights.`
+  const ollamaResponse = await callOllamaJson(prompt)
+  const aiResponse = ollamaResponse || (await callGeminiJson(prompt))
   if (Array.isArray(aiResponse?.insights) && aiResponse.insights.length) {
-    source = 'gemini'
+    source = ollamaResponse ? 'ollama' : 'gemini'
     insights = aiResponse.insights.slice(0, 3).map((item) => ({
       title: cleanText(item?.title, 80) || 'Insight',
       summary: cleanText(item?.summary, 240) || '',
@@ -947,8 +967,8 @@ async function fetchMfNav(schemeCode) {
 
 async function handleMarketSearch(request, response, url, database) {
   const user = await authUser(request, database)
-  if (!user) return json(response, 401, { error: 'Sign in online to search market instruments.' })
-  const limit = await checkRateLimit(`market-search:${user.id}`, 60, 60 * 60 * 1000, database)
+  const actorKey = user ? user.id : getClientIp(request)
+  const limit = await checkRateLimit(`market-search:${actorKey}`, 60, 60 * 60 * 1000, database)
   if (!limit.ok) return json(response, 429, { error: `Too many market searches. Wait ${limit.resetInSeconds}s.` })
 
   const query = cleanText(url.searchParams.get('q'), 80)
@@ -1016,8 +1036,8 @@ async function handleMarketSearch(request, response, url, database) {
 
 async function handleMarketQuotes(request, response, body, database) {
   const user = await authUser(request, database)
-  if (!user) return json(response, 401, { error: 'Sign in online to fetch live market quotes.' })
-  const limit = await checkRateLimit(`market-quotes:${user.id}`, 60, 60 * 60 * 1000, database)
+  const actorKey = user ? user.id : getClientIp(request)
+  const limit = await checkRateLimit(`market-quotes:${actorKey}`, 60, 60 * 60 * 1000, database)
   if (!limit.ok) return json(response, 429, { error: `Too many quote refreshes. Wait ${limit.resetInSeconds}s.` })
 
   const instruments = Array.isArray(body.instruments) ? body.instruments.slice(0, 50) : []
@@ -1187,8 +1207,8 @@ async function handleImportInvestmentReport(request, response, body, database) {
 
 async function handleAiChat(request, response, body, database) {
   const user = await authUser(request, database)
-  if (!user) return json(response, 401, { error: 'Sign in online to chat with FinGrow AI.' })
-  const limit = await checkRateLimit(`ai-chat:${user.id}`, 40, 60 * 60 * 1000, database)
+  const actorKey = user ? user.id : getClientIp(request)
+  const limit = await checkRateLimit(`ai-chat:${actorKey}`, 40, 60 * 60 * 1000, database)
   if (!limit.ok) return json(response, 429, { error: `Too many AI chat requests. Wait ${limit.resetInSeconds}s.` })
 
   const question = cleanText(body.question, 500)
@@ -1199,12 +1219,12 @@ async function handleAiChat(request, response, body, database) {
 
   let reply = null
   let source = 'server-rules'
-  const aiResult = await callGeminiJson(
-    `You are FinGrow's personal finance assistant. Workspace totals (minor units): ${JSON.stringify(summary)}. Recent conversation: ${JSON.stringify(history)}. User question: "${question}". Return JSON {"reply": string} with a concise, practical answer.`,
-  )
+  const prompt = `You are FinGrow's personal finance assistant. Workspace totals (minor units): ${JSON.stringify(summary)}. Recent conversation: ${JSON.stringify(history)}. User question: "${question}". Return JSON {"reply": string} with a concise, practical answer.`
+  const ollamaResult = await callOllamaJson(prompt)
+  const aiResult = ollamaResult || (await callGeminiJson(prompt))
   if (typeof aiResult?.reply === 'string' && aiResult.reply.trim()) {
     reply = cleanText(aiResult.reply, 1200)
-    source = 'gemini'
+    source = ollamaResult ? 'ollama' : 'gemini'
   } else {
     const balance = Math.round(Number(summary.totalBalanceMinor || 0) / 100)
     const income = Math.round(Number(summary.monthlyIncomeMinor || 0) / 100)
