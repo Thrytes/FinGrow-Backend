@@ -658,7 +658,10 @@ async function callOllamaJson(prompt, images = null, timeoutMs = 18000) {
     }
     const res = await fetch(`${ollamaUrl.replace(/\/+$/, '')}/api/generate`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true',
+      },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(timeoutMs),
     })
