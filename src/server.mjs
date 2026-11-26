@@ -647,16 +647,20 @@ function hasUnsafeEmbeddedPayload(buffer, mimeType) {
   return /\/(?:JavaScript|JS|Launch|OpenAction|AA|RichMedia)\b|<script\b/i.test(sample)
 }
 
-async function callOllamaJson(prompt) {
+async function callOllamaJson(prompt, images = null, timeoutMs = 18000) {
   const ollamaUrl = process.env.OLLAMA_BASE_URL || (onVercel ? '' : 'http://127.0.0.1:11434')
   if (!ollamaUrl) return null
-  const model = process.env.OLLAMA_MODEL || 'llama3.2'
+  const model = process.env.OLLAMA_MODEL || 'FinGrowVL'
   try {
+    const payload = { model, prompt, format: 'json', stream: false }
+    if (Array.isArray(images) && images.length > 0) {
+      payload.images = images
+    }
     const res = await fetch(`${ollamaUrl.replace(/\/+$/, '')}/api/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, prompt, format: 'json', stream: false }),
-      signal: AbortSignal.timeout(4000),
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs),
     })
     if (!res.ok) return null
     const data = await res.json()
@@ -665,6 +669,124 @@ async function callOllamaJson(prompt) {
   } catch {
     return null
   }
+}
+
+function extractReadablePdfText(buffer) {
+  const latin = buffer.subarray(0, Math.min(buffer.length, 2 * 1024 * 1024)).toString('latin1')
+  const chunks = []
+  let inParen = false
+  let escaped = false
+  let current = ''
+  for (let i = 0; i < latin.length; i++) {
+    const ch = latin[i]
+    if (escaped) {
+      current += ch
+      escaped = false
+      continue
+    }
+    if (ch === '\\' && inParen) {
+      escaped = true
+      continue
+    }
+    if (ch === '(' && !inParen) {
+      inParen = true
+      current = ''
+      continue
+    }
+    if (ch === ')' && inParen) {
+      inParen = false
+      const cleaned = current.replaceAll(/[^\x20-\x7E]/g, ' ').trim()
+      if (cleaned.length >= 2) chunks.push(cleaned)
+      if (chunks.length >= 1500) break
+      continue
+    }
+    if (inParen && current.length < 240) {
+      current += ch
+    }
+  }
+  return chunks.join(' ').slice(0, 14000)
+}
+
+function buildDocumentAnalysisPrompt(docKind, fileName, textContext) {
+  const schema =
+    '{"detectedKind":"cas"|"bank_statement"|"receipt"|"other","accounts":[{"name":string,"institution":string,"type":"bank"|"credit-card"|"cash"|"investment","currency":"INR","balanceMinor":number,"lastFour":string|null}],"transactions":[{"type":"expense"|"income","amountMinor":number,"category":string,"note":string,"occurredAt":string,"accountName":string|null}],"holdings":[{"symbol":string,"name":string,"assetType":"stock"|"mf"|"etf"|"gold"|"bond","quantity":number,"avgPriceMinor":number,"currentPriceMinor":number}],"investmentTransactions":[{"symbol":string,"assetType":"stock"|"mf"|"etf"|"gold"|"bond","action":"buy"|"sell"|"sip"|"dividend","quantity":number,"priceMinor":number,"occurredAt":string}]}'
+  const hint =
+    docKind === 'cas'
+      ? 'This is a CAS / Investment statement. Separate stocks, mutual funds, ETFs, gold, and bonds with quantity, avgPriceMinor, currentPriceMinor (performance), and buy/sell/SIP transactions.'
+      : docKind === 'bank_statement'
+        ? 'This is a Bank Statement. Extract the bank account details (name, institution, lastFour, ending balanceMinor) and all debit (expense) / credit (income) transactions.'
+        : docKind === 'receipt'
+          ? 'This is a Receipt or Bill. Extract the merchant, total amountMinor, category, and date as an expense transaction.'
+          : 'Auto-detect whether this is a CAS investment statement, bank statement, receipt, or general financial document, and populate the matching arrays.'
+  return `You are FinGrowVL, a financial document parser. File: "${cleanText(fileName, 120)}". ${hint} All monetary amounts must be integer minor units (paise/cents, multiply rupees by 100). Return ONLY valid JSON matching: ${schema}.${textContext ? `\n\nDocument text:\n${textContext}` : ''}`
+}
+
+async function handleDocumentAnalyze(request, response, body, database) {
+  const user = await authUser(request, database)
+  const actorKey = user ? user.id : getClientIp(request)
+  const limit = await checkRateLimit(`doc-analyze:${actorKey}`, 25, 60 * 60 * 1000, database)
+  if (!limit.ok) return json(response, 429, { error: `Too many document analyses. Wait ${limit.resetInSeconds}s.` })
+
+  const fileName = cleanText(body.fileName, 160) || 'document'
+  const mimeType = cleanText(body.mimeType, 64).toLowerCase()
+  const docKind = cleanText(body.docKind, 24).toLowerCase() || 'auto'
+  const base64Content = typeof body.base64Content === 'string' ? body.base64Content.trim() : ''
+  const maxBytes = onVercel ? 3 * 1024 * 1024 : 10 * 1024 * 1024
+  if (!ALLOWED_REPORT_MIME_TYPES.has(mimeType) || !base64Content) {
+    return json(response, 400, { error: 'Upload a valid PDF, image, CSV, TXT, or JSON document.' })
+  }
+  const buffer = Buffer.from(base64Content, 'base64')
+  if (!buffer.length || buffer.length > maxBytes) {
+    return json(response, 400, { error: 'Document exceeds the allowed size limit.' })
+  }
+  if (ALLOWED_SCAN_MIME_TYPES.has(mimeType) && !matchesMagicBytes(buffer, mimeType)) {
+    return json(response, 422, { ok: false, safe: false, error: 'File contents do not match its declared file type.' })
+  }
+  if (hasUnsafeEmbeddedPayload(buffer, mimeType)) {
+    return json(response, 422, { ok: false, safe: false, error: 'Document failed security scan (active script or launch action detected).' })
+  }
+
+  let textContext = ''
+  if (mimeType === 'text/csv' || mimeType === 'text/plain' || mimeType === 'application/json') {
+    textContext = buffer.toString('utf8').slice(0, 14000)
+  } else if (mimeType === 'application/pdf') {
+    textContext = extractReadablePdfText(buffer)
+  }
+
+  const isImage = mimeType.startsWith('image/')
+  const prompt = buildDocumentAnalysisPrompt(docKind, fileName, textContext)
+  const ollamaParsed = await callOllamaJson(prompt, isImage ? [base64Content] : null, 20000)
+  const geminiParsed =
+    ollamaParsed || (await callGeminiJson(prompt, isImage || mimeType === 'application/pdf' ? { mime_type: mimeType, data: base64Content } : null))
+
+  let modelUsed = ollamaParsed ? 'FinGrowVL' : geminiParsed ? 'gemini' : 'deterministic'
+  let extracted = geminiParsed
+  if (!extracted && (mimeType === 'text/csv' || mimeType === 'text/plain')) {
+    const csv = parseCsvOrTextReport(buffer.toString('utf8'))
+    extracted = {
+      detectedKind: csv.holdings.length ? 'cas' : 'other',
+      accounts: [],
+      transactions: [],
+      holdings: csv.holdings,
+      investmentTransactions: csv.transactions,
+    }
+  }
+
+  const sha256 = createHash('sha256').update(buffer).digest('hex')
+  return json(response, 200, {
+    ok: true,
+    safe: true,
+    sha256,
+    modelUsed,
+    detectedKind: cleanText(extracted?.detectedKind, 24) || docKind,
+    accounts: Array.isArray(extracted?.accounts) ? extracted.accounts.slice(0, 20) : [],
+    transactions: Array.isArray(extracted?.transactions) ? extracted.transactions.slice(0, 300) : [],
+    holdings: Array.isArray(extracted?.holdings) ? extracted.holdings.slice(0, 200) : [],
+    investmentTransactions: Array.isArray(extracted?.investmentTransactions)
+      ? extracted.investmentTransactions.slice(0, 300)
+      : [],
+    scannedAt: new Date().toISOString(),
+  })
 }
 
 async function callGeminiJson(prompt, inlineData = null) {
@@ -1293,6 +1415,9 @@ async function route(request, response, database) {
   }
   if (request.method === 'POST' && pathname === '/v1/documents/scan') {
     return handleDocumentScan(request, response, await readJson(request), database)
+  }
+  if (request.method === 'POST' && pathname === '/v1/documents/analyze') {
+    return handleDocumentAnalyze(request, response, await readJson(request), database)
   }
   if (request.method === 'POST' && pathname === '/v1/insights/ai') {
     return handleAiInsights(request, response, await readJson(request), database)
