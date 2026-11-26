@@ -650,7 +650,7 @@ function hasUnsafeEmbeddedPayload(buffer, mimeType) {
 async function callOllamaJson(prompt, images = null, timeoutMs = 18000) {
   const ollamaUrl = process.env.OLLAMA_BASE_URL || (onVercel ? '' : 'http://127.0.0.1:11434')
   if (!ollamaUrl) return null
-  const model = process.env.OLLAMA_MODEL || 'FinGrowVL'
+  const model = process.env.OLLAMA_MODEL || 'fingro-vl:latest'
   try {
     const payload = { model, prompt, format: 'json', stream: false }
     if (Array.isArray(images) && images.length > 0) {
