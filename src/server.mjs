@@ -163,11 +163,10 @@ const json = (response, status, value, extraHeaders = {}) => {
 function setCors(request, response) {
   const origin = request.headers.origin
   if (!origin) return true
-  const isDevLocal =
-    process.env.NODE_ENV !== 'production' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
+  const isLocalDesktopOrigin = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
   const isAllowed =
     allowedOrigins.has(origin) ||
-    isDevLocal ||
+    isLocalDesktopOrigin ||
     /^https?:\/\/tauri\.localhost(:\d+)?$/.test(origin)
   if (!isAllowed) return false
   response.setHeader('Access-Control-Allow-Origin', origin)
@@ -1186,6 +1185,40 @@ async function handleImportInvestmentReport(request, response, body, database) {
   })
 }
 
+async function handleAiChat(request, response, body, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in online to chat with FinGrow AI.' })
+  const limit = await checkRateLimit(`ai-chat:${user.id}`, 40, 60 * 60 * 1000, database)
+  if (!limit.ok) return json(response, 429, { error: `Too many AI chat requests. Wait ${limit.resetInSeconds}s.` })
+
+  const question = cleanText(body.question, 500)
+  if (!question) return json(response, 400, { error: 'Enter a question for FinGrow AI.' })
+
+  const summary = body.summary && typeof body.summary === 'object' ? body.summary : {}
+  const history = Array.isArray(body.history) ? body.history.slice(-6) : []
+
+  let reply = null
+  let source = 'server-rules'
+  const aiResult = await callGeminiJson(
+    `You are FinGrow's personal finance assistant. Workspace totals (minor units): ${JSON.stringify(summary)}. Recent conversation: ${JSON.stringify(history)}. User question: "${question}". Return JSON {"reply": string} with a concise, practical answer.`,
+  )
+  if (typeof aiResult?.reply === 'string' && aiResult.reply.trim()) {
+    reply = cleanText(aiResult.reply, 1200)
+    source = 'gemini'
+  } else {
+    const balance = Math.round(Number(summary.totalBalanceMinor || 0) / 100)
+    const income = Math.round(Number(summary.monthlyIncomeMinor || 0) / 100)
+    const expense = Math.round(Number(summary.monthlyExpenseMinor || 0) / 100)
+    const overdue = Math.round(Number(summary.overdueMinor || 0) / 100)
+    reply =
+      overdue > 0
+        ? `Based on your workspace (liquid balance ${balance}, income ${income}, expense ${expense}), prioritize clearing ${overdue} in overdue dues first, then allocate surplus toward your savings/investment goals.`
+        : `Based on your workspace (liquid balance ${balance}, monthly income ${income}, expense ${expense}), your net monthly surplus is ${income - expense}. Connect an LLM key (GEMINI_API_KEY) on the backend later to enable full conversational AI answers.`
+  }
+
+  return json(response, 200, { ok: true, source, reply, answeredAt: new Date().toISOString() })
+}
+
 async function route(request, response, database) {
   if (!setCors(request, response)) return json(response, 403, { error: 'This app origin is not allowed.' })
   if (request.method === 'OPTIONS') {
@@ -1243,6 +1276,9 @@ async function route(request, response, database) {
   }
   if (request.method === 'POST' && pathname === '/v1/insights/ai') {
     return handleAiInsights(request, response, await readJson(request), database)
+  }
+  if (request.method === 'POST' && pathname === '/v1/insights/chat') {
+    return handleAiChat(request, response, await readJson(request), database)
   }
   if (request.method === 'POST' && pathname === '/v1/mobile/sms/parse') {
     return handleMobileSmsParse(request, response, await readJson(request), database)
