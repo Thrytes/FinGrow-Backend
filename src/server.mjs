@@ -707,38 +707,71 @@ async function callOllamaJson(prompt, images = null, timeoutMs = 240000) {
   }
 }
 
-function extractPdfStringsFromStreamText(streamStr, chunks, limit = 3000) {
+function extractPdfStringsFromStreamText(streamStr, chunks, limit = 4000) {
   let inParen = false
   let escaped = false
+  let inArray = false
   let current = ''
+  let arrayBuf = ''
+  let numBuf = ''
+
+  const flushChunk = (text) => {
+    const cleaned = text.replaceAll(/[^\x20-\x7E\n]/g, ' ').trim()
+    if (cleaned.length >= 1 && chunks.length < limit) chunks.push(cleaned)
+  }
+
   for (let i = 0; i < streamStr.length; i++) {
     const ch = streamStr[i]
-    if (escaped) {
-      if (ch === 'n') current += '\n'
-      else if (ch === 'r') current += ' '
-      else if (ch === 't') current += ' '
-      else current += ch
-      escaped = false
+    if (inParen) {
+      if (escaped) {
+        if (ch === 'n') current += '\n'
+        else if (ch === 'r' || ch === 't') current += ' '
+        else current += ch
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === ')') {
+        inParen = false
+        if (inArray) arrayBuf += current
+        else flushChunk(current)
+        continue
+      }
+      if (current.length < 400) current += ch
       continue
     }
-    if (ch === '\\' && inParen) {
-      escaped = true
-      continue
-    }
-    if (ch === '(' && !inParen) {
+
+    if (ch === '(') {
+      if (inArray && numBuf) {
+        const kern = Number(numBuf)
+        if (Number.isFinite(kern) && kern < -120) arrayBuf += ' '
+        numBuf = ''
+      }
       inParen = true
       current = ''
       continue
     }
-    if (ch === ')' && inParen) {
-      inParen = false
-      const cleaned = current.replaceAll(/[^\x20-\x7E\n]/g, ' ').trim()
-      if (cleaned.length >= 1) chunks.push(cleaned)
-      if (chunks.length >= limit) break
+
+    if (ch === '[') {
+      inArray = true
+      arrayBuf = ''
+      numBuf = ''
       continue
     }
-    if (inParen && current.length < 300) {
-      current += ch
+    if (ch === ']' && inArray) {
+      inArray = false
+      flushChunk(arrayBuf)
+      arrayBuf = ''
+      numBuf = ''
+      continue
+    }
+    if (inArray && ((ch >= '0' && ch <= '9') || ch === '-' || ch === '.')) {
+      numBuf += ch
+    } else if (inArray) {
+      numBuf = ''
     }
   }
 }
@@ -925,7 +958,7 @@ async function handleDocumentAnalyze(request, response, body, database) {
   const ollamaParsed = await callOllamaJson(
     prompt,
     isImage ? [base64Content] : null,
-    onVercel ? 22000 : 120000,
+    onVercel ? 50000 : 120000,
   )
   const geminiParsed = ollamaParsed || (
     aiConsent
