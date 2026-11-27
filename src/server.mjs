@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, randomInt, randomUUID, scrypt, tim
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { promisify } from 'node:util'
+import { inflateRawSync, inflateSync } from 'node:zlib'
 import { createStore } from './database.mjs'
 
 const scryptAsync = promisify(scrypt)
@@ -700,16 +701,17 @@ async function callOllamaJson(prompt, images = null, timeoutMs = 240000) {
   }
 }
 
-function extractReadablePdfText(buffer) {
-  const latin = buffer.subarray(0, Math.min(buffer.length, 2 * 1024 * 1024)).toString('latin1')
-  const chunks = []
+function extractPdfStringsFromStreamText(streamStr, chunks, limit = 3000) {
   let inParen = false
   let escaped = false
   let current = ''
-  for (let i = 0; i < latin.length; i++) {
-    const ch = latin[i]
+  for (let i = 0; i < streamStr.length; i++) {
+    const ch = streamStr[i]
     if (escaped) {
-      current += ch
+      if (ch === 'n') current += '\n'
+      else if (ch === 'r') current += ' '
+      else if (ch === 't') current += ' '
+      else current += ch
       escaped = false
       continue
     }
@@ -724,16 +726,64 @@ function extractReadablePdfText(buffer) {
     }
     if (ch === ')' && inParen) {
       inParen = false
-      const cleaned = current.replaceAll(/[^\x20-\x7E]/g, ' ').trim()
-      if (cleaned.length >= 2) chunks.push(cleaned)
-      if (chunks.length >= 1500) break
+      const cleaned = current.replaceAll(/[^\x20-\x7E\n]/g, ' ').trim()
+      if (cleaned.length >= 1) chunks.push(cleaned)
+      if (chunks.length >= limit) break
       continue
     }
-    if (inParen && current.length < 240) {
+    if (inParen && current.length < 300) {
       current += ch
     }
   }
-  return chunks.join(' ').slice(0, 14000)
+}
+
+function extractReadablePdfText(buffer) {
+  const capped = buffer.subarray(0, Math.min(buffer.length, 4 * 1024 * 1024))
+  const chunks = []
+  let pos = 0
+  const streamToken = Buffer.from('stream')
+  const endToken = Buffer.from('endstream')
+
+  while (pos < capped.length && chunks.length < 3000) {
+    const startIdx = capped.indexOf(streamToken, pos)
+    if (startIdx < 0) break
+    let dataStart = startIdx + streamToken.length
+    if (capped[dataStart] === 0x0d && capped[dataStart + 1] === 0x0a) dataStart += 2
+    else if (capped[dataStart] === 0x0a || capped[dataStart] === 0x0d) dataStart += 1
+    else {
+      pos = dataStart
+      continue
+    }
+    const endIdx = capped.indexOf(endToken, dataStart)
+    if (endIdx < 0) break
+    const rawSlice = capped.subarray(dataStart, endIdx)
+    pos = endIdx + endToken.length
+
+    let decoded = null
+    try {
+      decoded = inflateSync(rawSlice).toString('latin1')
+    } catch {
+      try {
+        decoded = inflateRawSync(rawSlice).toString('latin1')
+      } catch {
+        const plain = rawSlice.toString('latin1')
+        if (plain.includes('BT') && plain.includes('Tj')) decoded = plain
+      }
+    }
+    if (decoded && (decoded.includes('Tj') || decoded.includes('TJ') || decoded.includes('BT'))) {
+      extractPdfStringsFromStreamText(decoded, chunks, 3000)
+    }
+  }
+
+  if (chunks.length === 0) {
+    const latin = capped.toString('latin1')
+    const btIndex = latin.indexOf('BT')
+    if (btIndex >= 0) {
+      extractPdfStringsFromStreamText(latin.slice(btIndex), chunks, 1500)
+    }
+  }
+
+  return chunks.join(' ').replaceAll(/\s+/g, ' ').trim().slice(0, 14000)
 }
 
 function buildDocumentAnalysisPrompt(docKind, fileName, textContext) {
