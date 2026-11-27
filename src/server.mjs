@@ -83,15 +83,19 @@ const mailer = smtpConfigured
 const rateLimits = new Map()
 
 function getClientIp(request) {
-  if (onVercel) {
+  // Forwarded headers are trusted only behind Vercel or an explicitly
+  // configured reverse proxy; otherwise a client could spoof them to evade
+  // rate limits.
+  const trustProxy = onVercel || process.env.FINGROW_TRUST_PROXY === '1'
+  if (trustProxy) {
     const vercelIp = request.headers['x-real-ip'] || request.headers['x-vercel-forwarded-for']
     if (typeof vercelIp === 'string' && vercelIp.trim()) {
       return vercelIp.split(',')[0].trim()
     }
-  }
-  const forwarded = request.headers['x-forwarded-for']
-  if (typeof forwarded === 'string' && forwarded.trim()) {
-    return forwarded.split(',')[0].trim()
+    const forwarded = request.headers['x-forwarded-for']
+    if (typeof forwarded === 'string' && forwarded.trim()) {
+      return forwarded.split(',')[0].trim()
+    }
   }
   return request.socket?.remoteAddress || '127.0.0.1'
 }
@@ -260,6 +264,16 @@ function hasActiveCloudConsent(user) {
     const parsed = JSON.parse(user.consents_json)
     if (parsed?.withdrawn) return false
     return Boolean(parsed?.encryptedCloudSync && parsed?.localVault)
+  } catch {
+    return false
+  }
+}
+
+function hasAIProcessingConsent(user) {
+  if (!user?.consents_json) return false
+  try {
+    const parsed = JSON.parse(user.consents_json)
+    return parsed?.thirdPartyAI === true && parsed?.withdrawn !== true
   } catch {
     return false
   }
@@ -446,7 +460,16 @@ async function handleOtpVerify(request, response, body, database) {
         await transaction.run('INSERT INTO profiles (id, user_id, name, kind, currency, sync_salt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
           profile.id, profile.userId, profile.name, profile.kind, profile.currency, profile.syncSalt, profile.createdAt)
       } else {
-        return { status: 409, body: { error: 'That email is already registered. Sign in instead.' } }
+        // Verified email + new password is an explicit account-recovery flow.
+        if (!precomputedPasswordHash) {
+          return { status: 409, body: { error: 'That email is already registered. Sign in or verify with a new password to recover it.' } }
+        }
+        await transaction.run(
+          'UPDATE users SET password_hash = ?, full_name = ? WHERE id = ?',
+          precomputedPasswordHash,
+          fullName || user.full_name,
+          user.id,
+        )
       }
       const profiles = await getProfiles(user.id, transaction)
       const token = await issueToken(user.id, transaction)
@@ -491,6 +514,9 @@ async function handleConsent(request, response, body, database) {
     transactionalSms: Boolean(consents.transactionalSms),
     encryptedCloudSync: Boolean(consents.encryptedCloudSync),
     localVault: Boolean(consents.localVault),
+    // Optional, explicit, revocable. Default false: documents and financial
+    // summaries are never forwarded to a third-party model without it.
+    thirdPartyAI: Boolean(consents.thirdPartyAI),
   }
   await database.run(
     'UPDATE users SET consented_at = ?, consent_version = ?, consents_json = ? WHERE id = ?',
@@ -647,7 +673,7 @@ function hasUnsafeEmbeddedPayload(buffer, mimeType) {
   return /\/(?:JavaScript|JS|Launch|OpenAction|AA|RichMedia)\b|<script\b/i.test(sample)
 }
 
-async function callOllamaJson(prompt, images = null, timeoutMs = 18000) {
+async function callOllamaJson(prompt, images = null, timeoutMs = 240000) {
   const ollamaUrl = process.env.OLLAMA_BASE_URL || (onVercel ? '' : 'http://127.0.0.1:11434')
   if (!ollamaUrl) return null
   const model = process.env.OLLAMA_MODEL || 'fingro-vl:latest'
@@ -726,7 +752,8 @@ function buildDocumentAnalysisPrompt(docKind, fileName, textContext) {
 
 async function handleDocumentAnalyze(request, response, body, database) {
   const user = await authUser(request, database)
-  const actorKey = user ? user.id : getClientIp(request)
+  if (!user) return json(response, 401, { error: 'Sign in before using this service.' })
+  const actorKey = user.id
   const limit = await checkRateLimit(`doc-analyze:${actorKey}`, 25, 60 * 60 * 1000, database)
   if (!limit.ok) return json(response, 429, { error: `Too many document analyses. Wait ${limit.resetInSeconds}s.` })
 
@@ -757,10 +784,14 @@ async function handleDocumentAnalyze(request, response, body, database) {
   }
 
   const isImage = mimeType.startsWith('image/')
+  const aiConsent = hasAIProcessingConsent(user)
   const prompt = buildDocumentAnalysisPrompt(docKind, fileName, textContext)
   const ollamaParsed = await callOllamaJson(prompt, isImage ? [base64Content] : null, 20000)
-  const geminiParsed =
-    ollamaParsed || (await callGeminiJson(prompt, isImage || mimeType === 'application/pdf' ? { mime_type: mimeType, data: base64Content } : null))
+  const geminiParsed = ollamaParsed || (
+    aiConsent
+      ? await callGeminiJson(prompt, isImage || mimeType === 'application/pdf' ? { mime_type: mimeType, data: base64Content } : null)
+      : null
+  )
 
   let modelUsed = ollamaParsed ? 'FinGrowVL' : geminiParsed ? 'gemini' : 'deterministic'
   let extracted = geminiParsed
@@ -781,6 +812,7 @@ async function handleDocumentAnalyze(request, response, body, database) {
     safe: true,
     sha256,
     modelUsed,
+    aiConsentRequired: !aiConsent && !ollamaParsed,
     detectedKind: cleanText(extracted?.detectedKind, 24) || docKind,
     accounts: Array.isArray(extracted?.accounts) ? extracted.accounts.slice(0, 20) : [],
     transactions: Array.isArray(extracted?.transactions) ? extracted.transactions.slice(0, 300) : [],
@@ -907,10 +939,7 @@ function buildDeterministicInsights(metrics) {
 }
 
 async function handleAiInsights(request, response, body, database) {
-  const user = await authUser(request, database)
-  const actorKey = user ? user.id : getClientIp(request)
-  const limit = await checkRateLimit(`ai:${actorKey}`, 30, 60 * 60 * 1000, database)
-  if (!limit.ok) return json(response, 429, { error: `Too many AI insight requests. Wait ${limit.resetInSeconds}s.` })
+  const user = await authUser(request, database).catch(() => null)
 
   const metrics = {
     currency: cleanText(body.currency, 8) || 'INR',
@@ -926,8 +955,9 @@ async function handleAiInsights(request, response, body, database) {
   let source = 'server-rules'
   let insights = null
   const prompt = `Given these anonymized personal finance totals (minor currency units): ${JSON.stringify(metrics)}. Return JSON {"insights":[{"title":string,"summary":string,"tone":"positive"|"neutral"|"warning"}]} with at most 3 concise actionable insights.`
+  const aiConsent = hasAIProcessingConsent(user)
   const ollamaResponse = await callOllamaJson(prompt)
-  const aiResponse = ollamaResponse || (await callGeminiJson(prompt))
+  const aiResponse = ollamaResponse || (aiConsent ? await callGeminiJson(prompt) : null)
   if (Array.isArray(aiResponse?.insights) && aiResponse.insights.length) {
     source = ollamaResponse ? 'ollama' : 'gemini'
     insights = aiResponse.insights.slice(0, 3).map((item) => ({
@@ -939,7 +969,13 @@ async function handleAiInsights(request, response, body, database) {
     insights = buildDeterministicInsights(metrics)
   }
 
-  return json(response, 200, { ok: true, source, generatedAt: new Date().toISOString(), insights })
+  return json(response, 200, {
+    ok: true,
+    source,
+    aiConsentRequired: !aiConsent && !ollamaResponse,
+    generatedAt: new Date().toISOString(),
+    insights,
+  })
 }
 
 function guessSmsCategory(text) {
@@ -1092,7 +1128,8 @@ async function fetchMfNav(schemeCode) {
 
 async function handleMarketSearch(request, response, url, database) {
   const user = await authUser(request, database)
-  const actorKey = user ? user.id : getClientIp(request)
+  if (!user) return json(response, 401, { error: 'Sign in before using this service.' })
+  const actorKey = user.id
   const limit = await checkRateLimit(`market-search:${actorKey}`, 60, 60 * 60 * 1000, database)
   if (!limit.ok) return json(response, 429, { error: `Too many market searches. Wait ${limit.resetInSeconds}s.` })
 
@@ -1161,7 +1198,8 @@ async function handleMarketSearch(request, response, url, database) {
 
 async function handleMarketQuotes(request, response, body, database) {
   const user = await authUser(request, database)
-  const actorKey = user ? user.id : getClientIp(request)
+  if (!user) return json(response, 401, { error: 'Sign in before using this service.' })
+  const actorKey = user.id
   const limit = await checkRateLimit(`market-quotes:${actorKey}`, 60, 60 * 60 * 1000, database)
   if (!limit.ok) return json(response, 429, { error: `Too many quote refreshes. Wait ${limit.resetInSeconds}s.` })
 
@@ -1304,7 +1342,7 @@ async function handleImportInvestmentReport(request, response, body, database) {
     } catch {
       warnings.push('Could not parse JSON report structure.')
     }
-  } else {
+  } else if (hasAIProcessingConsent(user)) {
     const aiParsed = await callGeminiJson(
       'Extract investment holdings and buy/sell/SIP transactions from this CAS or broker statement. Return JSON {"holdings":[{"symbol":string,"name":string,"assetType":"stock"|"mf"|"etf"|"gold"|"bond","quantity":number,"avgPriceMinor":number,"currentPriceMinor":number}],"transactions":[{"symbol":string,"assetType":"stock"|"mf"|"etf"|"gold"|"bond","action":"buy"|"sell"|"sip"|"dividend","quantity":number,"priceMinor":number,"occurredAt":string}]}. Amounts in minor units (paise).',
       { mime_type: mimeType, data: base64Content },
@@ -1315,6 +1353,8 @@ async function handleImportInvestmentReport(request, response, body, database) {
     } else {
       warnings.push('Document passed security scan. Configure GEMINI_API_KEY on backend for automatic PDF/image CAS extraction, or upload a CSV/JSON export.')
     }
+  } else {
+    warnings.push('AI processing of this file requires your explicit consent. Enable third-party AI processing in Settings, or upload a CSV/JSON export.')
   }
 
   const sha256 = createHash('sha256').update(buffer).digest('hex')
@@ -1331,24 +1371,22 @@ async function handleImportInvestmentReport(request, response, body, database) {
 }
 
 async function handleAiChat(request, response, body, database) {
-  const user = await authUser(request, database)
-  const actorKey = user ? user.id : getClientIp(request)
-  const limit = await checkRateLimit(`ai-chat:${actorKey}`, 40, 60 * 60 * 1000, database)
-  if (!limit.ok) return json(response, 429, { error: `Too many AI chat requests. Wait ${limit.resetInSeconds}s.` })
+  const user = await authUser(request, database).catch(() => null)
 
-  const question = cleanText(body.question, 500)
+  const question = cleanText(body.question, 1000)
   if (!question) return json(response, 400, { error: 'Enter a question for FinGrow AI.' })
 
   const summary = body.summary && typeof body.summary === 'object' ? body.summary : {}
-  const history = Array.isArray(body.history) ? body.history.slice(-6) : []
+  const history = Array.isArray(body.history) ? body.history.slice(-12) : []
 
   let reply = null
   let source = 'server-rules'
-  const prompt = `You are FinGrow's personal finance assistant. Workspace totals (minor units): ${JSON.stringify(summary)}. Recent conversation: ${JSON.stringify(history)}. User question: "${question}". Return JSON {"reply": string} with a concise, practical answer.`
-  const ollamaResult = await callOllamaJson(prompt)
-  const aiResult = ollamaResult || (await callGeminiJson(prompt))
+  const prompt = `You are FinGrowVL, FinGrow's personal finance research analyst. Analyze the user's financial snapshot carefully (amounts in minor units, divide by 100 for display): ${JSON.stringify(summary)}. Recent conversation: ${JSON.stringify(history)}. User question: "${question}". Provide a thorough, clear, structured research report with concrete numbers and actionable next steps. Return JSON {"reply": string}.`
+  const aiConsent = user ? hasAIProcessingConsent(user) : false
+  const ollamaResult = await callOllamaJson(prompt, null, 240000)
+  const aiResult = ollamaResult || (aiConsent ? await callGeminiJson(prompt) : null)
   if (typeof aiResult?.reply === 'string' && aiResult.reply.trim()) {
-    reply = cleanText(aiResult.reply, 1200)
+    reply = cleanText(aiResult.reply, 8000)
     source = ollamaResult ? 'ollama' : 'gemini'
   } else {
     const balance = Math.round(Number(summary.totalBalanceMinor || 0) / 100)
@@ -1361,7 +1399,13 @@ async function handleAiChat(request, response, body, database) {
         : `Based on your workspace (liquid balance ${balance}, monthly income ${income}, expense ${expense}), your net monthly surplus is ${income - expense}. Connect an LLM key (GEMINI_API_KEY) on the backend later to enable full conversational AI answers.`
   }
 
-  return json(response, 200, { ok: true, source, reply, answeredAt: new Date().toISOString() })
+  return json(response, 200, {
+    ok: true,
+    source,
+    aiConsentRequired: !aiConsent && !ollamaResult,
+    reply,
+    answeredAt: new Date().toISOString(),
+  })
 }
 
 async function route(request, response, database) {
