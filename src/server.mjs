@@ -679,7 +679,13 @@ async function callOllamaJson(prompt, images = null, timeoutMs = 240000) {
   if (!ollamaUrl) return null
   const model = process.env.OLLAMA_MODEL || 'fingro-vl:latest'
   try {
-    const payload = { model, prompt, format: 'json', stream: false }
+    const payload = {
+      model,
+      prompt,
+      format: 'json',
+      stream: false,
+      options: { num_predict: 1200, temperature: 0.1 },
+    }
     if (Array.isArray(images) && images.length > 0) {
       payload.images = images
     }
@@ -893,11 +899,33 @@ async function handleDocumentAnalyze(request, response, body, database) {
 
   const isImage = mimeType.startsWith('image/')
   const aiConsent = user ? hasAIProcessingConsent(user) : false
+
+  // Fast-path: parse structured CAS PDFs/text in milliseconds before waiting on remote LLM
+  if (textContext && (docKind === 'cas' || docKind === 'auto')) {
+    const fastCas = parseCasTextFallback(textContext)
+    if (fastCas.holdings.length > 0) {
+      const sha256 = createHash('sha256').update(buffer).digest('hex')
+      return json(response, 200, {
+        ok: true,
+        safe: true,
+        sha256,
+        modelUsed: 'cas-parser',
+        aiConsentRequired: false,
+        detectedKind: 'cas',
+        accounts: fastCas.accounts,
+        transactions: fastCas.transactions,
+        holdings: fastCas.holdings.slice(0, 200),
+        investmentTransactions: fastCas.investmentTransactions.slice(0, 300),
+        scannedAt: new Date().toISOString(),
+      })
+    }
+  }
+
   const prompt = buildDocumentAnalysisPrompt(docKind, fileName, textContext)
   const ollamaParsed = await callOllamaJson(
     prompt,
     isImage ? [base64Content] : null,
-    onVercel ? 42000 : 180000,
+    onVercel ? 22000 : 120000,
   )
   const geminiParsed = ollamaParsed || (
     aiConsent
