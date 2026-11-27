@@ -800,6 +800,65 @@ function buildDocumentAnalysisPrompt(docKind, fileName, textContext) {
   return `You are FinGrowVL, a financial document parser. File: "${cleanText(fileName, 120)}". ${hint} All monetary amounts must be integer minor units (paise/cents, multiply rupees by 100). Return ONLY valid JSON matching: ${schema}.${textContext ? `\n\nDocument text:\n${textContext}` : ''}`
 }
 
+function parseInrNumber(raw) {
+  const num = Number(String(raw || '').replaceAll(',', '').trim())
+  return Number.isFinite(num) ? num : 0
+}
+
+function parseCasTextFallback(text) {
+  const holdings = []
+  const seenSymbols = new Set()
+  const dematRe = /\b(INE[A-Z0-9]{9})\s+([A-Za-z0-9 .&-]{2,60}?)\s+([A-Z][A-Z0-9&-]{1,14})\s+([0-9][0-9,]*(?:\.[0-9]+)?)\s+([0-9][0-9,]*(?:\.[0-9]+)?)\s+([0-9][0-9,]*(?:\.[0-9]+)?)\s+([0-9][0-9,]*(?:\.[0-9]+)?)/g
+  let m
+  while ((m = dematRe.exec(text)) !== null) {
+    const symbol = m[3].toUpperCase()
+    const qty = parseInrNumber(m[4])
+    const closePrice = parseInrNumber(m[5])
+    const costTotal = parseInrNumber(m[7])
+    if (!symbol || qty <= 0 || closePrice <= 0 || seenSymbols.has(symbol)) continue
+    seenSymbols.add(symbol)
+    const currentPriceMinor = Math.round(closePrice * 100)
+    const avgPriceMinor = costTotal > 0 ? Math.round((costTotal * 100) / qty) : currentPriceMinor
+    holdings.push({
+      symbol,
+      name: cleanText(m[2], 100),
+      assetType: 'stock',
+      quantity: qty,
+      avgPriceMinor,
+      currentPriceMinor,
+    })
+  }
+
+  const mfRe = /([A-Za-z0-9 .&-]{4,70}?(?:Fund|Plan|Scheme))\s+([0-9]{6,14})\s+(?:Direct|Regular)\s*-\s*[A-Za-z]+\s+([0-9][0-9,]*(?:\.[0-9]+)?)\s+([0-9][0-9,]*(?:\.[0-9]+)?)\s+([0-9][0-9,]*(?:\.[0-9]+)?)/gi
+  while ((m = mfRe.exec(text)) !== null) {
+    const folio = m[2]
+    const symbol = `MF:${folio}`
+    const units = parseInrNumber(m[3])
+    const nav = parseInrNumber(m[4])
+    const costTotal = parseInrNumber(m[5])
+    if (units <= 0 || nav <= 0 || seenSymbols.has(symbol)) continue
+    seenSymbols.add(symbol)
+    const currentPriceMinor = Math.round(nav * 100)
+    const avgPriceMinor = costTotal > 0 ? Math.round((costTotal * 100) / units) : currentPriceMinor
+    holdings.push({
+      symbol,
+      name: cleanText(m[1], 100),
+      assetType: 'mf',
+      quantity: units,
+      avgPriceMinor,
+      currentPriceMinor,
+    })
+  }
+
+  return {
+    detectedKind: holdings.length ? 'cas' : 'other',
+    accounts: [],
+    transactions: [],
+    holdings,
+    investmentTransactions: [],
+  }
+}
+
 async function handleDocumentAnalyze(request, response, body, database) {
   const user = await authUser(request, database).catch(() => null)
   const actorKey = user ? user.id : getClientIp(request)
@@ -833,9 +892,13 @@ async function handleDocumentAnalyze(request, response, body, database) {
   }
 
   const isImage = mimeType.startsWith('image/')
-  const aiConsent = hasAIProcessingConsent(user)
+  const aiConsent = user ? hasAIProcessingConsent(user) : false
   const prompt = buildDocumentAnalysisPrompt(docKind, fileName, textContext)
-  const ollamaParsed = await callOllamaJson(prompt, isImage ? [base64Content] : null, 20000)
+  const ollamaParsed = await callOllamaJson(
+    prompt,
+    isImage ? [base64Content] : null,
+    onVercel ? 42000 : 180000,
+  )
   const geminiParsed = ollamaParsed || (
     aiConsent
       ? await callGeminiJson(prompt, isImage || mimeType === 'application/pdf' ? { mime_type: mimeType, data: base64Content } : null)
@@ -844,6 +907,16 @@ async function handleDocumentAnalyze(request, response, body, database) {
 
   let modelUsed = ollamaParsed ? 'FinGrowVL' : geminiParsed ? 'gemini' : 'deterministic'
   let extracted = geminiParsed
+  if (
+    (!extracted || (!extracted.holdings?.length && !extracted.accounts?.length && !extracted.transactions?.length)) &&
+    textContext
+  ) {
+    const casParsed = parseCasTextFallback(textContext)
+    if (casParsed.holdings.length > 0) {
+      extracted = casParsed
+      modelUsed = ollamaParsed ? 'FinGrowVL+cas-parser' : 'cas-parser'
+    }
+  }
   if (!extracted && (mimeType === 'text/csv' || mimeType === 'text/plain')) {
     const csv = parseCsvOrTextReport(buffer.toString('utf8'))
     extracted = {
