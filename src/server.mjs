@@ -751,9 +751,8 @@ function buildDocumentAnalysisPrompt(docKind, fileName, textContext) {
 }
 
 async function handleDocumentAnalyze(request, response, body, database) {
-  const user = await authUser(request, database)
-  if (!user) return json(response, 401, { error: 'Sign in before using this service.' })
-  const actorKey = user.id
+  const user = await authUser(request, database).catch(() => null)
+  const actorKey = user ? user.id : getClientIp(request)
   const limit = await checkRateLimit(`doc-analyze:${actorKey}`, 25, 60 * 60 * 1000, database)
   if (!limit.ok) return json(response, 429, { error: `Too many document analyses. Wait ${limit.resetInSeconds}s.` })
 
@@ -1127,9 +1126,8 @@ async function fetchMfNav(schemeCode) {
 }
 
 async function handleMarketSearch(request, response, url, database) {
-  const user = await authUser(request, database)
-  if (!user) return json(response, 401, { error: 'Sign in before using this service.' })
-  const actorKey = user.id
+  const user = await authUser(request, database).catch(() => null)
+  const actorKey = user ? user.id : getClientIp(request)
   const limit = await checkRateLimit(`market-search:${actorKey}`, 60, 60 * 60 * 1000, database)
   if (!limit.ok) return json(response, 429, { error: `Too many market searches. Wait ${limit.resetInSeconds}s.` })
 
@@ -1197,9 +1195,8 @@ async function handleMarketSearch(request, response, url, database) {
 }
 
 async function handleMarketQuotes(request, response, body, database) {
-  const user = await authUser(request, database)
-  if (!user) return json(response, 401, { error: 'Sign in before using this service.' })
-  const actorKey = user.id
+  const user = await authUser(request, database).catch(() => null)
+  const actorKey = user ? user.id : getClientIp(request)
   const limit = await checkRateLimit(`market-quotes:${actorKey}`, 60, 60 * 60 * 1000, database)
   if (!limit.ok) return json(response, 429, { error: `Too many quote refreshes. Wait ${limit.resetInSeconds}s.` })
 
