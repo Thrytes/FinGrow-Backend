@@ -56,6 +56,21 @@ const schemaStatements = [
     count INTEGER NOT NULL,
     reset_at INTEGER NOT NULL
   ) STRICT`,
+  `CREATE TABLE IF NOT EXISTS profile_documents (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    profile_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    extracted_summary TEXT,
+    content_base64 TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  ) STRICT`,
+  'CREATE INDEX IF NOT EXISTS profile_docs_user_profile_idx ON profile_documents(user_id, profile_id, created_at)',
 ]
 
 class LocalSqliteStore {

@@ -1370,6 +1370,108 @@ async function handleImportInvestmentReport(request, response, body, database) {
   })
 }
 
+function extractDocumentTextForAi(mimeType, base64Content) {
+  if (!base64Content) return ''
+  try {
+    const buffer = Buffer.from(base64Content, 'base64')
+    if (mimeType === 'application/pdf') return extractReadablePdfText(buffer)
+    if (mimeType === 'text/csv' || mimeType === 'text/plain' || mimeType === 'application/json') {
+      return buffer.toString('utf8').slice(0, 12000)
+    }
+  } catch {}
+  return ''
+}
+
+async function resolveProfileForUser(database, userId, profileId) {
+  const exact = await database.get('SELECT id FROM profiles WHERE id = ? AND user_id = ?', profileId, userId)
+  if (exact) return exact.id
+  const primary = await database.get('SELECT id FROM profiles WHERE user_id = ? ORDER BY created_at ASC LIMIT 1', userId)
+  return primary?.id || null
+}
+
+async function handleProfileDocuments(request, response, profileId, database) {
+  const user = await authUser(request, database)
+  if (!user) return json(response, 401, { error: 'Sign in to sync profile documents.' })
+  const resolvedProfileId = await resolveProfileForUser(database, user.id, profileId)
+  if (!resolvedProfileId) return json(response, 404, { error: 'Profile not found.' })
+
+  if (request.method === 'GET') {
+    const rows = await database.all(
+      'SELECT id, profile_id, title, category, file_name, mime_type, file_size, sha256, extracted_summary, created_at FROM profile_documents WHERE user_id = ? AND profile_id = ? ORDER BY created_at DESC LIMIT 100',
+      user.id,
+      resolvedProfileId,
+    )
+    return json(response, 200, {
+      ok: true,
+      documents: rows.map((row) => ({
+        id: row.id,
+        profileId: row.profile_id,
+        title: row.title,
+        category: row.category,
+        fileName: row.file_name,
+        mimeType: row.mime_type,
+        fileSize: Number(row.file_size),
+        sha256: row.sha256,
+        extractedSummary: row.extracted_summary || '',
+        createdAt: new Date(Number(row.created_at)).toISOString(),
+      })),
+    })
+  }
+
+  const body = await readJson(request)
+  const docId = cleanText(body.id, 80) || randomUUID()
+  const title = cleanText(body.title, 140)
+  const category = cleanText(body.category, 32).toLowerCase() || 'other'
+  const fileName = cleanText(body.fileName, 180) || 'document'
+  const mimeType = cleanText(body.mimeType, 64).toLowerCase()
+  const base64Content = typeof body.base64Content === 'string' ? body.base64Content.trim() : ''
+  const extractedSummary = cleanText(body.extractedSummary, 4000)
+  const maxBytes = onVercel ? 3 * 1024 * 1024 : 10 * 1024 * 1024
+
+  if (!title || !ALLOWED_REPORT_MIME_TYPES.has(mimeType) || !base64Content) {
+    return json(response, 400, { error: 'Provide a valid document title, type, and content.' })
+  }
+  const buffer = Buffer.from(base64Content, 'base64')
+  if (!buffer.length || buffer.length > maxBytes) {
+    return json(response, 400, { error: 'Document exceeds allowed backend storage size.' })
+  }
+  if (ALLOWED_SCAN_MIME_TYPES.has(mimeType) && !matchesMagicBytes(buffer, mimeType)) {
+    return json(response, 422, { error: 'File contents do not match its declared type.' })
+  }
+  if (hasUnsafeEmbeddedPayload(buffer, mimeType)) {
+    return json(response, 422, { error: 'Document failed security scan.' })
+  }
+
+  const sha256 = createHash('sha256').update(buffer).digest('hex')
+  const now = Date.now()
+  await database.run(
+    `INSERT INTO profile_documents (id, user_id, profile_id, title, category, file_name, mime_type, file_size, sha256, extracted_summary, content_base64, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       title = excluded.title,
+       category = excluded.category,
+       file_name = excluded.file_name,
+       mime_type = excluded.mime_type,
+       file_size = excluded.file_size,
+       sha256 = excluded.sha256,
+       extracted_summary = excluded.extracted_summary,
+       content_base64 = excluded.content_base64`,
+    docId,
+    user.id,
+    resolvedProfileId,
+    title,
+    category,
+    fileName,
+    mimeType,
+    buffer.length,
+    sha256,
+    extractedSummary,
+    base64Content,
+    now,
+  )
+  return json(response, 200, { ok: true, id: docId, sha256, profileId: resolvedProfileId })
+}
+
 async function handleAiChat(request, response, body, database) {
   const user = await authUser(request, database).catch(() => null)
 
@@ -1378,12 +1480,61 @@ async function handleAiChat(request, response, body, database) {
 
   const summary = body.summary && typeof body.summary === 'object' ? body.summary : {}
   const history = Array.isArray(body.history) ? body.history.slice(-12) : []
+  const attachedIds = Array.isArray(body.attachedDocumentIds) ? body.attachedDocumentIds.slice(0, 5) : []
+  const inlineAttachments = Array.isArray(body.attachedDocuments) ? body.attachedDocuments.slice(0, 5) : []
+
+  const docContexts = []
+  const attachedImages = []
+
+  if (user && attachedIds.length > 0) {
+    for (const rawId of attachedIds) {
+      const docId = cleanText(rawId, 80)
+      if (!docId) continue
+      const row = await database.get(
+        'SELECT title, category, mime_type, extracted_summary, content_base64 FROM profile_documents WHERE id = ? AND user_id = ?',
+        docId,
+        user.id,
+      )
+      if (!row) continue
+      const mime = String(row.mime_type || '')
+      if (mime.startsWith('image/') && row.content_base64 && attachedImages.length < 3) {
+        attachedImages.push(row.content_base64)
+      }
+      const extractedText = extractDocumentTextForAi(mime, row.content_base64)
+      docContexts.push({
+        title: row.title,
+        category: row.category,
+        summary: row.extracted_summary || '',
+        text: extractedText.slice(0, 6000),
+      })
+    }
+  }
+
+  for (const item of inlineAttachments) {
+    const title = cleanText(item?.title, 140)
+    const mime = cleanText(item?.mimeType, 64).toLowerCase()
+    const b64 = typeof item?.base64Content === 'string' ? item.base64Content.trim() : ''
+    if (!title) continue
+    if (mime.startsWith('image/') && b64 && attachedImages.length < 3) {
+      attachedImages.push(b64)
+    }
+    const extractedText = extractDocumentTextForAi(mime, b64)
+    docContexts.push({
+      title,
+      category: cleanText(item?.category, 32) || 'document',
+      summary: cleanText(item?.summary, 1000),
+      text: extractedText.slice(0, 6000),
+    })
+  }
 
   let reply = null
   let source = 'server-rules'
-  const prompt = `You are FinGrowVL, FinGrow's personal finance research analyst. Analyze the user's financial snapshot carefully (amounts in minor units, divide by 100 for display): ${JSON.stringify(summary)}. Recent conversation: ${JSON.stringify(history)}. User question: "${question}". Provide a thorough, clear, structured research report with concrete numbers and actionable next steps. Return JSON {"reply": string}.`
+  const attachmentSection = docContexts.length
+    ? `\n\nAttached uploaded documents:\n${JSON.stringify(docContexts)}`
+    : ''
+  const prompt = `You are FinGrowVL, FinGrow's personal finance research analyst. Analyze the user's financial snapshot carefully (amounts in minor units, divide by 100 for display): ${JSON.stringify(summary)}. Recent conversation: ${JSON.stringify(history)}.${attachmentSection}\n\nUser question: "${question}". Provide a thorough, clear, structured research report with concrete numbers and actionable next steps. Return JSON {"reply": string}.`
   const aiConsent = user ? hasAIProcessingConsent(user) : false
-  const ollamaResult = await callOllamaJson(prompt, null, 240000)
+  const ollamaResult = await callOllamaJson(prompt, attachedImages.length ? attachedImages : null, 240000)
   const aiResult = ollamaResult || (aiConsent ? await callGeminiJson(prompt) : null)
   if (typeof aiResult?.reply === 'string' && aiResult.reply.trim()) {
     reply = cleanText(aiResult.reply, 8000)
@@ -1483,6 +1634,23 @@ async function route(request, response, database) {
   }
   if (request.method === 'POST' && pathname === '/v1/investments/import-report') {
     return handleImportInvestmentReport(request, response, await readJson(request), database)
+  }
+
+  const profileDocsDeleteRoute = /^\/v1\/profiles\/([A-Za-z0-9_-]{1,80})\/documents\/([A-Za-z0-9_-]{1,80})$/.exec(pathname)
+  if (profileDocsDeleteRoute && request.method === 'DELETE') {
+    const user = await authUser(request, database)
+    if (!user) return json(response, 401, { error: 'Sign in to delete profile documents.' })
+    await database.run(
+      'DELETE FROM profile_documents WHERE id = ? AND user_id = ?',
+      profileDocsDeleteRoute[2],
+      user.id,
+    )
+    return json(response, 200, { ok: true })
+  }
+
+  const profileDocsRoute = /^\/v1\/profiles\/([A-Za-z0-9_-]{1,80})\/documents$/.exec(pathname)
+  if (profileDocsRoute && (request.method === 'GET' || request.method === 'POST')) {
+    return handleProfileDocuments(request, response, profileDocsRoute[1], database)
   }
 
   const profileRoute = /^\/v1\/profiles\/([A-Za-z0-9_-]{1,80})\/snapshot$/.exec(pathname)
